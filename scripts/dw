@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+binary="$(command -v diffviewer 2>/dev/null || true)"
+if [ -z "$binary" ]; then
+  echo "dw: diffviewer is not installed; run scripts/install.sh" >&2
+  exit 1
+fi
+
+target="${1:-.}"
+if [ ! -d "$target" ]; then
+  echo "dw: $target is not a directory" >&2
+  exit 1
+fi
+
+nohup "$binary" "$target" >/dev/null 2>&1 &
