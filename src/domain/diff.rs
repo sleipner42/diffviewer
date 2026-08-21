@@ -47,14 +47,16 @@ impl SideBySideDiff {
             .unwrap_or(0)
     }
 
-    pub fn max_line_chars(&self) -> usize {
-        self.rows
-            .iter()
-            .flat_map(|row| [row.left.as_ref(), row.right.as_ref()])
-            .flatten()
-            .map(|side| side.text.chars().count())
-            .max()
-            .unwrap_or(0)
+    pub fn max_line_chars_by_side(&self) -> (usize, usize) {
+        let widest = |pick: fn(&DiffRow) -> Option<&LineSide>| {
+            self.rows
+                .iter()
+                .filter_map(pick)
+                .map(|side| side.text.chars().count())
+                .max()
+                .unwrap_or(0)
+        };
+        (widest(|row| row.left.as_ref()), widest(|row| row.right.as_ref()))
     }
 }
 

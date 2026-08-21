@@ -38,6 +38,7 @@ pub fn paint_code_line(
     emphasis: &[Range<usize>],
     style: &LineStyle,
     pointer: Option<PointerState>,
+    scroll_x: f32,
 ) -> Option<WordHit> {
     let gutter = Rect::from_min_size(rect.min, vec2(gutter_width, rect.height()));
     if style.background != Color32::TRANSPARENT {
@@ -51,11 +52,13 @@ pub fn paint_code_line(
         style.font.clone(),
         style.line_number_color,
     );
+    let text_area = Rect::from_min_max(pos2(gutter.right(), rect.top()), rect.max);
+    let text_painter = painter.with_clip_rect(text_area.intersect(painter.clip_rect()));
     let job = line_job(text, spans, emphasis, style.font, style.text_color, style.emphasis_background);
-    let galley = painter.layout_job(job);
-    let text_pos = pos2(gutter.right() + TEXT_PADDING, rect.top() + ROW_PADDING_Y);
+    let galley = text_painter.layout_job(job);
+    let text_pos = pos2(gutter.right() + TEXT_PADDING - scroll_x, rect.top() + ROW_PADDING_Y);
     let hit = pointer
-        .filter(|pointer| pointer.command && rect.contains(pointer.pos) && pointer.pos.x >= text_pos.x)
+        .filter(|pointer| pointer.command && text_area.contains(pointer.pos))
         .and_then(|pointer| {
             let cursor = galley.cursor_from_pos(pointer.pos - text_pos);
             word_at_char(text, cursor.index.0)
@@ -64,13 +67,17 @@ pub fn paint_code_line(
         let left = galley.pos_from_cursor(CCursor::new(CharIndex(char_range.start))).left();
         let right = galley.pos_from_cursor(CCursor::new(CharIndex(char_range.end))).left();
         let y = text_pos.y + galley.size().y - 1.0;
-        painter.line_segment(
+        text_painter.line_segment(
             [pos2(text_pos.x + left, y), pos2(text_pos.x + right, y)],
             Stroke::new(1.0, style.link_color),
         );
     }
-    painter.galley(text_pos, galley, style.text_color);
+    text_painter.galley(text_pos, galley, style.text_color);
     hit.map(|(word_hit, _)| word_hit)
+}
+
+pub fn text_width(char_count: usize, char_width: f32) -> f32 {
+    char_count as f32 * char_width + TEXT_PADDING * 2.0
 }
 
 pub fn line_job(

@@ -223,7 +223,7 @@ fn body(ui: &mut Ui, source: &LoadedSource, scroll_pending: &mut bool, theme: &T
                 link_color: theme.accent,
             };
             let spans = source.spans.get(index).map(Vec::as_slice).unwrap_or(&[]);
-            let hit = paint_code_line(&painter, rect, gutter_width, index + 1, &source.lines[index], spans, &[], &style, pointer);
+            let hit = paint_code_line(&painter, rect, gutter_width, index + 1, &source.lines[index], spans, &[], &style, pointer, 0.0);
             if hit.is_some() {
                 ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
             }

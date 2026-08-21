@@ -17,7 +17,7 @@ pub enum RenderedBody {
         diff: SideBySideDiff,
         left: Vec<Vec<Span>>,
         right: Vec<Vec<Span>>,
-        max_chars: usize,
+        max_chars: [usize; 2],
         max_line_number: usize,
     },
     Binary,
@@ -36,8 +36,9 @@ impl RenderedDiff {
             DiffContent::Text(diff) => {
                 let left = highlighter.highlight(file_diff.file.head_path(), &file_diff.old_text);
                 let right = highlighter.highlight(&file_diff.file.path, &file_diff.new_text);
+                let (left_chars, right_chars) = diff.max_line_chars_by_side();
                 RenderedBody::Text {
-                    max_chars: diff.max_line_chars(),
+                    max_chars: [left_chars, right_chars],
                     max_line_number: diff.max_line_number(),
                     diff,
                     left,
