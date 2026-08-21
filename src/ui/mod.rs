@@ -1,7 +1,9 @@
 pub mod app;
+mod code_line;
 mod commit_box;
 mod diff_view;
 mod file_list;
 mod keymap;
+mod peek_view;
 mod rendered;
 mod theme;

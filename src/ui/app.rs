@@ -1,22 +1,27 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use egui::{Align, Button, CentralPanel, Context, Frame, Id, Layout, Modal, Panel, RichText, TextStyle, Ui, ViewportCommand};
 
+use super::code_line::WordHit;
 use super::commit_box::{self, CommitAction};
 use super::diff_view::{self, DiffViewState};
 use super::file_list::{self, FileListAction};
 use super::keymap::{self, Command};
+use super::peek_view::{self, LoadedSource, PeekAction, PeekState};
 use super::rendered::{RenderedDiff, ViewRow, view_rows};
 use super::theme::Theme;
 use crate::application::review_service::{RepoSnapshot, ReviewService};
 use crate::domain::change::{ChangeKind, ChangedFile, StageState};
 use crate::domain::importance::FileGroup;
 use crate::infra::config::AppConfig;
+use crate::infra::editor;
 use crate::infra::git_cli::GitCli;
 use crate::infra::highlight::Highlighter;
+use crate::infra::index_worker::spawn_index_build;
 use crate::infra::status_worker::{StatusWorker, WorkerEvent};
 
 pub struct DiffViewerApp {
@@ -43,6 +48,9 @@ struct Workspace {
     rows_key: Option<RowsKey>,
     scroll_list_to_selected: bool,
     scroll_to_first_hunk: bool,
+    peek: Option<PeekState>,
+    index_events: Receiver<Result<usize, String>>,
+    indexed_files: Option<usize>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -126,6 +134,8 @@ impl DiffViewerApp {
             }
         };
         ctx.send_viewport_cmd(ViewportCommand::Title(format!("{} — diffviewer", service.repo_name())));
+        let index_ctx = ctx.clone();
+        let index_events = spawn_index_build(Arc::clone(&service), Box::new(move || index_ctx.request_repaint()));
         self.workspace = Some(Workspace {
             service,
             worker,
@@ -137,6 +147,9 @@ impl DiffViewerApp {
             rows_key: None,
             scroll_list_to_selected: false,
             scroll_to_first_hunk: false,
+            peek: None,
+            index_events,
+            indexed_files: None,
         });
         self.apply_snapshot(snapshot);
     }
@@ -151,8 +164,32 @@ impl DiffViewerApp {
                 .find(path)
                 .is_some_and(|file| file.same_content_identity(&rendered.file))
         });
+        let touched: Vec<PathBuf> = workspace
+            .snapshot
+            .files()
+            .chain(snapshot.files())
+            .map(|file| file.path.clone())
+            .collect();
+        workspace.service.refresh_symbols(touched.iter().map(PathBuf::as_path));
         workspace.snapshot = snapshot;
         workspace.revalidate_selection(hide_tests);
+    }
+
+    fn drain_index_events(&mut self) {
+        let results: Vec<Result<usize, String>> = match &self.workspace {
+            Some(workspace) => workspace.index_events.try_iter().collect(),
+            None => return,
+        };
+        for result in results {
+            match result {
+                Ok(count) => {
+                    if let Some(workspace) = self.workspace.as_mut() {
+                        workspace.indexed_files = Some(count);
+                    }
+                }
+                Err(error) => self.report_error(format!("symbol index: {error}")),
+            }
+        }
     }
 
     fn drain_worker_events(&mut self) {
@@ -193,6 +230,8 @@ impl DiffViewerApp {
             Command::Commit => self.commit(),
             Command::FocusCommit => self.focus_commit = true,
             Command::Discard => self.pending_discard = self.selected_file(),
+            Command::ClosePeek => self.close_peek(),
+            Command::PeekBack => self.peek_back(),
             Command::Unfocus => ctx.memory_mut(|memory| {
                 if let Some(id) = memory.focused() {
                     memory.surrender_focus(id);
@@ -491,6 +530,80 @@ impl DiffViewerApp {
         }
     }
 
+    fn open_definition(&mut self, file: PathBuf, hit: WordHit, chain: bool) {
+        let Some(workspace) = self.workspace.as_mut() else {
+            return;
+        };
+        let symbols = workspace.service.definitions(&file, &hit.word, hit.attribute_access);
+        if symbols.is_empty() {
+            let message = match workspace.indexed_files {
+                Some(_) => format!("No definition found for {}", hit.word),
+                None => "Symbol index is still building, try again in a moment".to_string(),
+            };
+            self.report_info(message);
+            return;
+        }
+        match (workspace.peek.as_mut(), chain) {
+            (Some(peek), true) => peek.navigate(symbols),
+            _ => workspace.peek = Some(PeekState::new(symbols)),
+        }
+        self.ensure_peek_loaded();
+    }
+
+    fn ensure_peek_loaded(&mut self) {
+        let Some(workspace) = self.workspace.as_mut() else {
+            return;
+        };
+        let Some(symbol) = workspace
+            .peek
+            .as_ref()
+            .filter(|peek| peek.source.is_none())
+            .and_then(|peek| peek.symbol().cloned())
+        else {
+            return;
+        };
+        match workspace.service.peek(&symbol) {
+            Ok(source) => {
+                if let Some(peek) = workspace.peek.as_mut() {
+                    peek.source = Some(LoadedSource::build(source, &self.highlighter));
+                }
+            }
+            Err(error) => {
+                workspace.peek = None;
+                self.report_error(error.to_string());
+            }
+        }
+    }
+
+    fn close_peek(&mut self) {
+        if let Some(workspace) = self.workspace.as_mut() {
+            workspace.peek = None;
+        }
+    }
+
+    fn peek_back(&mut self) {
+        let Some(workspace) = self.workspace.as_mut() else {
+            return;
+        };
+        let went_back = workspace.peek.as_mut().is_some_and(PeekState::back);
+        if !went_back {
+            workspace.peek = None;
+        }
+    }
+
+    fn open_peek_in_editor(&mut self) {
+        let Some(workspace) = self.workspace.as_ref() else {
+            return;
+        };
+        let Some(symbol) = workspace.peek.as_ref().and_then(|peek| peek.symbol().cloned()) else {
+            return;
+        };
+        let absolute = workspace.service.root().join(&symbol.path);
+        if let Err(error) = editor::open_in_editor(&self.config.editor_command, &absolute, symbol.line) {
+            self.report_error(error.to_string());
+        }
+    }
+
     fn report_error(&mut self, text: String) {
         self.status = Some(StatusLine { text, is_error: true, shown_at: Instant::now() });
     }
@@ -594,6 +707,14 @@ impl DiffViewerApp {
                                 .color(self.theme.text_faint)
                                 .small(),
                         );
+                        if let Some(workspace) = &self.workspace {
+                            let index_label = match workspace.indexed_files {
+                                Some(count) => format!("{count} py files indexed"),
+                                None => "indexing symbols…".to_string(),
+                            };
+                            ui.label(RichText::new(index_label).color(self.theme.text_faint).small());
+                            ui.separator();
+                        }
                     });
                 });
             });
@@ -653,6 +774,9 @@ impl DiffViewerApp {
 
     fn show_center(&mut self, ui: &mut Ui) {
         let mut header_action = None;
+        let mut peek_action = None;
+        let mut definition_request: Option<(PathBuf, WordHit)> = None;
+        let editor_name = editor::editor_display_name(&self.config.editor_command);
         CentralPanel::default()
             .frame(Frame::NONE.fill(self.theme.bg))
             .show(ui, |ui| {
@@ -675,13 +799,53 @@ impl DiffViewerApp {
                     .show(ui, |ui| {
                         header_action = show_diff_header(ui, &file, hunk_count, current_hunk, &self.theme);
                     });
+                if workspace.peek.is_some() {
+                    Panel::bottom(Id::new("peek_panel"))
+                        .resizable(true)
+                        .default_size(PEEK_DEFAULT_HEIGHT)
+                        .size_range(PEEK_MIN_HEIGHT..=PEEK_MAX_HEIGHT)
+                        .show(ui, |ui| {
+                            if let Some(peek) = workspace.peek.as_mut() {
+                                peek_action = peek_view::show(ui, peek, &editor_name, &self.theme);
+                            }
+                        });
+                }
                 CentralPanel::default()
                     .frame(Frame::NONE)
                     .show(ui, |ui| match workspace.diffs.get(&path) {
-                        Some(rendered) => diff_view::show(ui, rendered, &workspace.rows, &mut workspace.view, &self.theme),
+                        Some(rendered) => {
+                            if let Some(hit) = diff_view::show(ui, rendered, &workspace.rows, &mut workspace.view, &self.theme) {
+                                definition_request = Some((rendered.file.path.clone(), hit));
+                            }
+                        }
                         None => diff_view::centered_message(ui, "Loading…", &self.theme),
                     });
             });
+        if let Some((path, hit)) = definition_request {
+            self.open_definition(path, hit, false);
+        }
+        match peek_action {
+            Some(PeekAction::Close) => self.close_peek(),
+            Some(PeekAction::Back) => self.peek_back(),
+            Some(PeekAction::Choose(index)) => {
+                if let Some(peek) = self.workspace.as_mut().and_then(|workspace| workspace.peek.as_mut()) {
+                    peek.choose(index);
+                }
+            }
+            Some(PeekAction::Navigate(hit)) => {
+                let origin = self
+                    .workspace
+                    .as_ref()
+                    .and_then(|workspace| workspace.peek.as_ref())
+                    .and_then(|peek| peek.source.as_ref())
+                    .map(|source| source.path.clone());
+                if let Some(origin) = origin {
+                    self.open_definition(origin, hit, true);
+                }
+            }
+            Some(PeekAction::OpenInEditor) => self.open_peek_in_editor(),
+            None => {}
+        }
         match header_action {
             Some(HeaderAction::ToggleStage) => {
                 if let Some(path) = self.selected_path() {
@@ -740,6 +904,7 @@ impl eframe::App for DiffViewerApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.drain_worker_events();
+        self.drain_index_events();
         if self.pending_discard.is_none() {
             for command in keymap::poll(&ctx) {
                 self.dispatch(&ctx, command);
@@ -751,6 +916,7 @@ impl eframe::App for DiffViewerApp {
         self.show_left_panel(ui);
         self.ensure_diff_loaded();
         self.ensure_rows();
+        self.ensure_peek_loaded();
         self.show_center(ui);
         self.show_discard_modal(&ctx);
     }
@@ -763,6 +929,7 @@ impl Workspace {
         }
         self.selected = path;
         self.view.reset_for_new_file();
+        self.peek = None;
         self.rows_key = None;
         self.scroll_list_to_selected = true;
         self.scroll_to_first_hunk = true;
@@ -865,4 +1032,7 @@ const FILE_PANEL_DEFAULT_WIDTH: f32 = 400.0;
 const FILE_PANEL_MIN_WIDTH: f32 = 280.0;
 const FILE_PANEL_MAX_WIDTH: f32 = 800.0;
 const DISCARD_MODAL_WIDTH: f32 = 440.0;
+const PEEK_DEFAULT_HEIGHT: f32 = 340.0;
+const PEEK_MIN_HEIGHT: f32 = 120.0;
+const PEEK_MAX_HEIGHT: f32 = 900.0;
 const STATUS_LIFETIME: Duration = Duration::from_secs(8);

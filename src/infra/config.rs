@@ -10,6 +10,7 @@ pub struct AppConfig {
     pub policy: ImportancePolicy,
     pub hide_tests: bool,
     pub poll_interval: Duration,
+    pub editor_command: String,
     pub path: PathBuf,
     pub load_error: Option<String>,
 }
@@ -22,6 +23,7 @@ pub fn load() -> AppConfig {
             policy: defaults.policy,
             hide_tests: defaults.hide_tests,
             poll_interval: defaults.poll_interval,
+            editor_command: defaults.editor_command,
             path,
             load_error: None,
         };
@@ -37,6 +39,7 @@ pub fn load() -> AppConfig {
                 .poll_interval_ms
                 .map(Duration::from_millis)
                 .unwrap_or(defaults.poll_interval),
+            editor_command: file.editor_command.unwrap_or(defaults.editor_command),
             path,
             load_error: None,
         },
@@ -44,6 +47,7 @@ pub fn load() -> AppConfig {
             policy: defaults.policy,
             hide_tests: defaults.hide_tests,
             poll_interval: defaults.poll_interval,
+            editor_command: defaults.editor_command,
             path: path.clone(),
             load_error: Some(format!("{}: {}", path.display(), error.message())),
         },
@@ -56,6 +60,7 @@ struct ConfigFile {
     test_markers: Option<Vec<String>>,
     hide_tests: Option<bool>,
     poll_interval_ms: Option<u64>,
+    editor_command: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,6 +82,7 @@ struct Defaults {
     policy: ImportancePolicy,
     hide_tests: bool,
     poll_interval: Duration,
+    editor_command: String,
 }
 
 fn default_config() -> Defaults {
@@ -84,6 +90,7 @@ fn default_config() -> Defaults {
         policy: ImportancePolicy::new(default_tiers(), default_test_markers()),
         hide_tests: false,
         poll_interval: Duration::from_millis(DEFAULT_POLL_INTERVAL_MS),
+        editor_command: DEFAULT_EDITOR_COMMAND.to_string(),
     }
 }
 
@@ -118,3 +125,4 @@ fn config_path() -> PathBuf {
 
 const CONFIG_RELATIVE_PATH: &str = ".config/diffviewer/config.toml";
 const DEFAULT_POLL_INTERVAL_MS: u64 = 1000;
+const DEFAULT_EDITOR_COMMAND: &str = "zed {path}:{line}";

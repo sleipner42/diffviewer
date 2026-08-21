@@ -1,10 +1,9 @@
 use std::collections::HashSet;
-use std::ops::Range;
 use std::path::Path;
 
-use egui::text::LayoutJob;
-use egui::{Align2, Color32, FontId, Rect, Response, RichText, Sense, TextFormat, TextStyle, Ui, pos2, vec2};
+use egui::{Align2, Color32, CursorIcon, FontId, Rect, Response, RichText, Sense, TextStyle, Ui, pos2, vec2};
 
+use super::code_line::{GUTTER_PADDING, LineStyle, PointerState, ROW_PADDING_Y, TEXT_PADDING, WordHit, paint_code_line};
 use super::rendered::{RenderedBody, RenderedDiff, ViewRow};
 use super::theme::Theme;
 use crate::domain::diff::{DiffRow, LineSide, RowKind, SideBySideDiff};
@@ -34,16 +33,25 @@ impl DiffViewState {
     }
 }
 
-pub fn show(ui: &mut Ui, rendered: &RenderedDiff, view_rows: &[ViewRow], state: &mut DiffViewState, theme: &Theme) {
+pub fn show(
+    ui: &mut Ui,
+    rendered: &RenderedDiff,
+    view_rows: &[ViewRow],
+    state: &mut DiffViewState,
+    theme: &Theme,
+) -> Option<WordHit> {
     match &rendered.body {
-        RenderedBody::Binary => centered_message(ui, "Binary file", theme),
+        RenderedBody::Binary => {
+            centered_message(ui, "Binary file", theme);
+            None
+        }
         RenderedBody::Text { diff, left, right, max_chars, max_line_number } => {
             if diff.rows.is_empty() {
                 centered_message(ui, "Empty file", theme);
-                return;
+                return None;
             }
             let layout = compute_layout(ui, *max_chars, *max_line_number);
-            show_rows(ui, &rendered.file.path, diff, left, right, view_rows, state, &layout, theme);
+            show_rows(ui, &rendered.file.path, diff, left, right, view_rows, state, &layout, theme)
         }
     }
 }
@@ -103,7 +111,7 @@ fn show_rows(
     state: &mut DiffViewState,
     layout: &Layout,
     theme: &Theme,
-) {
+) -> Option<WordHit> {
     ui.spacing_mut().item_spacing.y = 0.0;
     let mut scroll = egui::ScrollArea::both()
         .id_salt(("diff_body", path))
@@ -112,13 +120,18 @@ fn show_rows(
         let offset = (row as f32 * layout.row_height - SCROLL_MARGIN).max(0.0);
         scroll = scroll.vertical_scroll_offset(offset);
     }
+    let (hover, command) = ui.input(|input| (input.pointer.hover_pos(), input.modifiers.command));
+    let pointer = hover.map(|pos| PointerState { pos, command });
+    let mut clicked = None;
     scroll.show_rows(ui, layout.row_height, view_rows.len(), |ui, range| {
         ui.set_min_width(layout.total_width);
         for index in range {
             match view_rows[index] {
                 ViewRow::Line(row_index) => {
                     if let Some(row) = diff.rows.get(row_index) {
-                        paint_line_row(ui, row, left_spans, right_spans, layout, theme);
+                        if let Some(hit) = paint_line_row(ui, row, left_spans, right_spans, layout, theme, pointer) {
+                            clicked = Some(hit);
+                        }
                     }
                 }
                 ViewRow::Gap { first, count } => {
@@ -129,17 +142,31 @@ fn show_rows(
             }
         }
     });
+    clicked
 }
 
-fn paint_line_row(ui: &mut Ui, row: &DiffRow, left_spans: &[Vec<Span>], right_spans: &[Vec<Span>], layout: &Layout, theme: &Theme) {
-    let (rect, _) = ui.allocate_exact_size(vec2(layout.total_width, layout.row_height), Sense::hover());
+fn paint_line_row(
+    ui: &mut Ui,
+    row: &DiffRow,
+    left_spans: &[Vec<Span>],
+    right_spans: &[Vec<Span>],
+    layout: &Layout,
+    theme: &Theme,
+    pointer: Option<PointerState>,
+) -> Option<WordHit> {
+    let (rect, response) = ui.allocate_exact_size(vec2(layout.total_width, layout.row_height), Sense::click());
     let side_size = vec2(layout.gutter_width + layout.pane_width, layout.row_height);
     let left_rect = Rect::from_min_size(rect.min, side_size);
     let right_rect = Rect::from_min_size(pos2(left_rect.right() + DIVIDER_WIDTH, rect.top()), side_size);
     let divider = Rect::from_min_max(pos2(left_rect.right(), rect.top()), pos2(right_rect.left(), rect.bottom()));
     ui.painter().rect_filled(divider, 0.0, theme.border);
-    paint_side(ui, left_rect, row.left.as_ref(), side_colors(row.kind, Side::Left, theme), left_spans, layout, theme);
-    paint_side(ui, right_rect, row.right.as_ref(), side_colors(row.kind, Side::Right, theme), right_spans, layout, theme);
+    let left_hit = paint_side(ui, left_rect, row.left.as_ref(), side_colors(row.kind, Side::Left, theme), left_spans, layout, theme, pointer);
+    let right_hit = paint_side(ui, right_rect, row.right.as_ref(), side_colors(row.kind, Side::Right, theme), right_spans, layout, theme, pointer);
+    let hit = left_hit.or(right_hit);
+    if hit.is_some() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    if response.clicked() { hit } else { None }
 }
 
 fn side_colors(kind: RowKind, side: Side, theme: &Theme) -> SideColors {
@@ -162,62 +189,33 @@ fn side_colors(kind: RowKind, side: Side, theme: &Theme) -> SideColors {
     }
 }
 
-fn paint_side(ui: &Ui, rect: Rect, side: Option<&LineSide>, colors: SideColors, spans: &[Vec<Span>], layout: &Layout, theme: &Theme) {
+#[allow(clippy::too_many_arguments)]
+fn paint_side(
+    ui: &Ui,
+    rect: Rect,
+    side: Option<&LineSide>,
+    colors: SideColors,
+    spans: &[Vec<Span>],
+    layout: &Layout,
+    theme: &Theme,
+    pointer: Option<PointerState>,
+) -> Option<WordHit> {
     let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
     let Some(line) = side else {
         painter.rect_filled(rect, 0.0, theme.filler);
-        return;
+        return None;
     };
-    let gutter = Rect::from_min_size(rect.min, vec2(layout.gutter_width, rect.height()));
-    if colors.background != Color32::TRANSPARENT {
-        painter.rect_filled(rect, 0.0, colors.background);
-    }
-    painter.rect_filled(gutter, 0.0, theme.gutter_bg);
-    painter.text(
-        pos2(gutter.right() - GUTTER_PADDING, rect.center().y),
-        Align2::RIGHT_CENTER,
-        line.number.to_string(),
-        layout.font.clone(),
-        colors.line_number,
-    );
+    let style = LineStyle {
+        font: &layout.font,
+        text_color: theme.text,
+        background: colors.background,
+        gutter_background: theme.gutter_bg,
+        line_number_color: colors.line_number,
+        emphasis_background: colors.emphasis,
+        link_color: theme.accent,
+    };
     let line_spans = spans.get(line.number - 1).map(Vec::as_slice).unwrap_or(&[]);
-    let job = line_job(&line.text, line_spans, &line.emphasis, &layout.font, theme.text, colors.emphasis);
-    let galley = painter.layout_job(job);
-    painter.galley(pos2(gutter.right() + TEXT_PADDING, rect.top() + ROW_PADDING_Y), galley, theme.text);
-}
-
-fn line_job(text: &str, spans: &[Span], emphasis: &[Range<usize>], font: &FontId, default_color: Color32, emphasis_bg: Color32) -> LayoutJob {
-    let mut job = LayoutJob::default();
-    job.wrap.max_width = f32::INFINITY;
-    if text.is_empty() {
-        return job;
-    }
-    let mut boundaries: Vec<usize> = vec![0, text.len()];
-    boundaries.extend(spans.iter().flat_map(|span| [span.range.start, span.range.end]));
-    boundaries.extend(emphasis.iter().flat_map(|range| [range.start, range.end]));
-    boundaries.retain(|&offset| offset <= text.len() && text.is_char_boundary(offset));
-    boundaries.sort_unstable();
-    boundaries.dedup();
-    for pair in boundaries.windows(2) {
-        let (start, end) = (pair[0], pair[1]);
-        let color = spans
-            .iter()
-            .find(|span| span.range.start <= start && start < span.range.end)
-            .map(|span| Color32::from_rgb(span.color.r, span.color.g, span.color.b))
-            .unwrap_or(default_color);
-        let emphasized = emphasis.iter().any(|range| range.start <= start && start < range.end);
-        job.append(
-            &text[start..end],
-            0.0,
-            TextFormat {
-                font_id: font.clone(),
-                color,
-                background: if emphasized { emphasis_bg } else { Color32::TRANSPARENT },
-                ..Default::default()
-            },
-        );
-    }
-    job
+    paint_code_line(&painter, rect, layout.gutter_width, line.number, &line.text, line_spans, &line.emphasis, &style, pointer)
 }
 
 fn paint_gap_row(ui: &mut Ui, count: usize, layout: &Layout, theme: &Theme) -> Response {
@@ -236,9 +234,6 @@ fn paint_gap_row(ui: &mut Ui, count: usize, layout: &Layout, theme: &Theme) -> R
     response
 }
 
-const ROW_PADDING_Y: f32 = 2.0;
-const GUTTER_PADDING: f32 = 8.0;
-const TEXT_PADDING: f32 = 10.0;
 const DIVIDER_WIDTH: f32 = 2.0;
 const SCROLL_MARGIN: f32 = 120.0;
 const GAP_LABEL_OFFSET: f32 = 24.0;

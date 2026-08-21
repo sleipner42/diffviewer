@@ -112,6 +112,27 @@ impl Repository for GitCli {
         Ok(files)
     }
 
+    fn source_files(&self, extension: &str) -> Result<Vec<PathBuf>> {
+        let pattern = format!("*.{extension}");
+        let output = self.run_read_only(&[
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            &pattern,
+        ])?;
+        let mut files: Vec<PathBuf> = output
+            .split(|&byte| byte == 0)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| PathBuf::from(String::from_utf8_lossy(entry).into_owned()))
+            .collect();
+        files.sort();
+        files.dedup();
+        Ok(files)
+    }
+
     fn head_content(&self, path: &Path) -> Result<Option<Vec<u8>>> {
         let spec = format!("{}:{}", self.diff_base(), path.to_string_lossy());
         match self.run_read_only(&["show", &spec]) {

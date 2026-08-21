@@ -19,3 +19,7 @@ hide_tests = false
 
 # How often the working tree is polled for changes.
 poll_interval_ms = 1000
+
+# Command used by the "Open in …" button in the definition peek.
+# {path} and {line} are substituted; the first word is the program.
+editor_command = "zed {path}:{line}"

@@ -1,11 +1,14 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use super::repository::{FileStamp, Repository};
 use crate::domain::change::{ChangedFile, StageState};
 use crate::domain::diff::{SideBySideDiff, side_by_side};
 use crate::domain::importance::{FileGroup, ImportancePolicy};
+use crate::domain::python::parse_python;
+use crate::domain::symbols::{DefinitionQuery, Symbol, SymbolIndex};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RepoSnapshot {
@@ -53,14 +56,83 @@ pub struct FileDiff {
     pub stamp: Option<FileStamp>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeekSource {
+    pub path: PathBuf,
+    pub text: String,
+    pub line: usize,
+}
+
 pub struct ReviewService {
     repo: Box<dyn Repository>,
     policy: ImportancePolicy,
+    symbols: RwLock<SymbolIndex>,
 }
 
 impl ReviewService {
     pub fn new(repo: Box<dyn Repository>, policy: ImportancePolicy) -> Self {
-        Self { repo, policy }
+        Self {
+            repo,
+            policy,
+            symbols: RwLock::new(SymbolIndex::default()),
+        }
+    }
+
+    pub fn rebuild_symbol_index(&self) -> Result<usize> {
+        let files = self.repo.source_files(PYTHON_EXTENSION)?;
+        let mut index = SymbolIndex::default();
+        for path in files {
+            if let Ok(Some(bytes)) = self.repo.worktree_content(&path) {
+                let text = String::from_utf8_lossy(&bytes);
+                index.insert(path.clone(), parse_python(&path, &text));
+            }
+        }
+        let count = index.file_count();
+        *self.symbols_write() = index;
+        Ok(count)
+    }
+
+    pub fn refresh_symbols<'a>(&self, paths: impl IntoIterator<Item = &'a Path>) {
+        let mut index = self.symbols_write();
+        for path in paths {
+            if path.extension().and_then(|ext| ext.to_str()) != Some(PYTHON_EXTENSION) {
+                continue;
+            }
+            match self.repo.worktree_content(path) {
+                Ok(Some(bytes)) => {
+                    let text = String::from_utf8_lossy(&bytes);
+                    index.insert(path.to_path_buf(), parse_python(path, &text));
+                }
+                _ => index.remove(path),
+            }
+        }
+    }
+
+    pub fn definitions(&self, file: &Path, word: &str, attribute_access: bool) -> Vec<Symbol> {
+        self.symbols_read().resolve(DefinitionQuery {
+            file,
+            word,
+            attribute_access,
+        })
+    }
+
+    pub fn peek(&self, symbol: &Symbol) -> Result<PeekSource> {
+        let Some(bytes) = self.repo.worktree_content(&symbol.path)? else {
+            bail!("{} no longer exists", symbol.path.display());
+        };
+        Ok(PeekSource {
+            path: symbol.path.clone(),
+            text: to_display_text(Some(bytes)),
+            line: symbol.line,
+        })
+    }
+
+    fn symbols_read(&self) -> std::sync::RwLockReadGuard<'_, SymbolIndex> {
+        self.symbols.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn symbols_write(&self) -> std::sync::RwLockWriteGuard<'_, SymbolIndex> {
+        self.symbols.write().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub fn root(&self) -> &Path {
@@ -161,5 +233,6 @@ fn to_display_text(bytes: Option<Vec<u8>>) -> String {
 }
 
 const BINARY_PROBE_BYTES: usize = 8000;
+const PYTHON_EXTENSION: &str = "py";
 const TAB_REPLACEMENT: &str = "    ";
 const UNKNOWN_BRANCH: &str = "?";

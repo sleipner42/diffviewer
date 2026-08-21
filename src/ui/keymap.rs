@@ -16,6 +16,8 @@ pub enum Command {
     FocusCommit,
     Discard,
     Unfocus,
+    ClosePeek,
+    PeekBack,
 }
 
 pub fn poll(ctx: &Context) -> Vec<Command> {
@@ -44,12 +46,13 @@ pub fn poll(ctx: &Context) -> Vec<Command> {
 }
 
 pub const HINTS: &str =
-    "j/k files · s stage · n/p hunks · e collapse · t tests · d discard · c commit message · ⌘↩ commit · ⌘O open";
+    "j/k files · s stage · n/p hunks · e collapse · t tests · d discard · c commit message · ⌘↩ commit · ⌘O open · ⌘click definition";
 
 const GLOBAL_BINDINGS: &[(Modifiers, Key, Command)] = &[
     (Modifiers::COMMAND, Key::Enter, Command::Commit),
     (Modifiers::COMMAND, Key::O, Command::OpenRepo),
     (Modifiers::COMMAND, Key::R, Command::Refresh),
+    (Modifiers::COMMAND, Key::OpenBracket, Command::PeekBack),
     (Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::A, Command::StageAll),
 ];
 
@@ -67,4 +70,5 @@ const PLAIN_BINDINGS: &[(Key, Command)] = &[
     (Key::R, Command::Refresh),
     (Key::C, Command::FocusCommit),
     (Key::D, Command::Discard),
+    (Key::Escape, Command::ClosePeek),
 ];
