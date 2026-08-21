@@ -1,0 +1,21 @@
+# Copy to ~/.config/diffviewer/config.toml
+# Every key is optional; missing keys fall back to these built-in values.
+
+# Files are grouped by the innermost directory that matches a tier marker,
+# in this order. Anything that matches no tier goes to "Other".
+tiers = [
+  { name = "Domain", markers = ["domain"] },
+  { name = "Use cases", markers = ["use_cases", "usecases", "use-cases"] },
+  { name = "Application", markers = ["application", "app", "api", "presentation"] },
+  { name = "Infrastructure", markers = ["infrastructure", "infra", "adapters"] },
+]
+
+# A file is a test if any directory matches one of these, or if its name looks
+# like test_*.py, *_test.py, conftest.py, *.test.ts, *.spec.ts.
+test_markers = ["tests", "test", "__tests__", "spec", "specs"]
+
+# Start with the Tests group hidden (toggle with "t").
+hide_tests = false
+
+# How often the working tree is polled for changes.
+poll_interval_ms = 1000
