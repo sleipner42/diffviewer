@@ -1,7 +1,8 @@
 use std::collections::HashMap;
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 use egui::{Align, Button, CentralPanel, Context, Frame, Id, Layout, Modal, Panel, RichText, TextStyle, Ui, ViewportCommand};
@@ -13,7 +14,9 @@ use super::file_list::{self, FileListAction};
 use super::keymap::{self, Command};
 use super::peek_view::{self, LoadedSource, PeekAction, PeekState};
 use super::rendered::{RenderedDiff, ViewRow, view_rows};
+use super::tab_bar::{self, TabAction, TabInfo};
 use super::theme::Theme;
+use crate::application::repository::Repository;
 use crate::application::review_service::{RepoSnapshot, ReviewService};
 use crate::domain::change::{ChangeKind, ChangedFile, StageState};
 use crate::domain::importance::FileGroup;
@@ -22,16 +25,20 @@ use crate::infra::editor;
 use crate::infra::git_cli::GitCli;
 use crate::infra::highlight::Highlighter;
 use crate::infra::index_worker::spawn_index_build;
+use crate::infra::single_instance;
 use crate::infra::status_worker::{StatusWorker, WorkerEvent};
+use crate::infra::updates::{self, CURRENT_VERSION, ReleaseInfo};
 
 pub struct DiffViewerApp {
     theme: Theme,
     highlighter: Highlighter,
     config: AppConfig,
-    workspace: Option<Workspace>,
+    tabs: Vec<Workspace>,
+    active: usize,
+    remote_opens: Receiver<PathBuf>,
+    update: UpdateState,
     hide_tests: bool,
     collapse_unchanged: bool,
-    commit_message: String,
     focus_commit: bool,
     status: Option<StatusLine>,
     pending_discard: Option<ChangedFile>,
@@ -51,6 +58,15 @@ struct Workspace {
     peek: Option<PeekState>,
     index_events: Receiver<Result<usize, String>>,
     indexed_files: Option<usize>,
+    commit_message: String,
+}
+
+struct UpdateState {
+    check: Receiver<Result<Option<ReleaseInfo>, String>>,
+    available: Option<ReleaseInfo>,
+    install: Option<Receiver<Result<(), String>>>,
+    installed: Option<String>,
+    homebrew: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -89,17 +105,40 @@ enum DiscardDecision {
 }
 
 impl DiffViewerApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, config: AppConfig, start_dir: PathBuf) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, config: AppConfig, start_dir: PathBuf, listener: Option<UnixListener>) -> Self {
         let theme = Theme::dark();
         theme.apply(&cc.egui_ctx);
+        let remote_opens = match listener {
+            Some(listener) => {
+                let ctx = cc.egui_ctx.clone();
+                single_instance::spawn_listener(
+                    listener,
+                    Box::new(move || {
+                        ctx.send_viewport_cmd(ViewportCommand::Focus);
+                        ctx.request_repaint();
+                    }),
+                )
+            }
+            None => channel().1,
+        };
+        let check_ctx = cc.egui_ctx.clone();
+        let update = UpdateState {
+            check: updates::spawn_check(Box::new(move || check_ctx.request_repaint())),
+            available: None,
+            install: None,
+            installed: None,
+            homebrew: updates::managed_by_homebrew(),
+        };
         let mut app = Self {
             theme,
             highlighter: Highlighter::new(),
             hide_tests: config.hide_tests,
             collapse_unchanged: false,
             config,
-            workspace: None,
-            commit_message: String::new(),
+            tabs: Vec::new(),
+            active: 0,
+            remote_opens,
+            update,
             focus_commit: false,
             status: None,
             pending_discard: None,
@@ -119,6 +158,10 @@ impl DiffViewerApp {
                 return;
             }
         };
+        if let Some(index) = self.tabs.iter().position(|tab| tab.service.root() == git.root()) {
+            self.activate_tab(ctx, index);
+            return;
+        }
         let service = Arc::new(ReviewService::new(Box::new(git), self.config.policy.clone()));
         let wake_ctx = ctx.clone();
         let worker = StatusWorker::spawn(
@@ -126,6 +169,8 @@ impl DiffViewerApp {
             self.config.poll_interval,
             Box::new(move || wake_ctx.request_repaint()),
         );
+        let index_ctx = ctx.clone();
+        let index_events = spawn_index_build(Arc::clone(&service), Box::new(move || index_ctx.request_repaint()));
         let snapshot = match service.snapshot() {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -133,10 +178,7 @@ impl DiffViewerApp {
                 RepoSnapshot::default()
             }
         };
-        ctx.send_viewport_cmd(ViewportCommand::Title(format!("{} — diffviewer", service.repo_name())));
-        let index_ctx = ctx.clone();
-        let index_events = spawn_index_build(Arc::clone(&service), Box::new(move || index_ctx.request_repaint()));
-        self.workspace = Some(Workspace {
+        self.tabs.push(Workspace {
             service,
             worker,
             snapshot: RepoSnapshot::default(),
@@ -150,13 +192,63 @@ impl DiffViewerApp {
             peek: None,
             index_events,
             indexed_files: None,
+            commit_message: String::new(),
         });
-        self.apply_snapshot(snapshot);
+        let index = self.tabs.len() - 1;
+        self.apply_snapshot(index, snapshot);
+        self.activate_tab(ctx, index);
     }
 
-    fn apply_snapshot(&mut self, snapshot: RepoSnapshot) {
+    fn activate_tab(&mut self, ctx: &Context, index: usize) {
+        if index < self.tabs.len() {
+            self.active = index;
+        }
+        self.pending_discard = None;
+        self.sync_title(ctx);
+    }
+
+    fn close_tab(&mut self, ctx: &Context, index: usize) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        self.tabs.remove(index);
+        if self.active >= self.tabs.len() {
+            self.active = self.tabs.len().saturating_sub(1);
+        } else if index < self.active {
+            self.active -= 1;
+        }
+        self.pending_discard = None;
+        self.sync_title(ctx);
+    }
+
+    fn cycle_tab(&mut self, ctx: &Context, delta: isize) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        let count = self.tabs.len() as isize;
+        let next = (self.active as isize + delta).rem_euclid(count) as usize;
+        self.activate_tab(ctx, next);
+    }
+
+    fn sync_title(&self, ctx: &Context) {
+        let title = match self.tabs.get(self.active) {
+            Some(tab) => format!("{} — diffviewer", tab.service.repo_name()),
+            None => "diffviewer".to_string(),
+        };
+        ctx.send_viewport_cmd(ViewportCommand::Title(title));
+    }
+
+    fn tab(&self) -> Option<&Workspace> {
+        self.tabs.get(self.active)
+    }
+
+    fn tab_mut(&mut self) -> Option<&mut Workspace> {
+        self.tabs.get_mut(self.active)
+    }
+
+    fn apply_snapshot(&mut self, index: usize, snapshot: RepoSnapshot) {
         let hide_tests = self.hide_tests;
-        let Some(workspace) = self.workspace.as_mut() else {
+        let Some(workspace) = self.tabs.get_mut(index) else {
             return;
         };
         workspace.diffs.retain(|path, rendered| {
@@ -175,32 +267,49 @@ impl DiffViewerApp {
         workspace.revalidate_selection(hide_tests);
     }
 
-    fn drain_index_events(&mut self) {
-        let results: Vec<Result<usize, String>> = match &self.workspace {
-            Some(workspace) => workspace.index_events.try_iter().collect(),
-            None => return,
-        };
-        for result in results {
-            match result {
-                Ok(count) => {
-                    if let Some(workspace) = self.workspace.as_mut() {
-                        workspace.indexed_files = Some(count);
-                    }
+    fn drain_background_events(&mut self, ctx: &Context) {
+        let remote: Vec<PathBuf> = self.remote_opens.try_iter().collect();
+        for path in remote {
+            self.open_repo(ctx, &path);
+        }
+        for index in 0..self.tabs.len() {
+            let events = self.tabs[index].worker.drain_events();
+            for event in events {
+                match event {
+                    WorkerEvent::Snapshot(snapshot) => self.apply_snapshot(index, snapshot),
+                    WorkerEvent::Failed(error) => self.report_error(error),
                 }
-                Err(error) => self.report_error(format!("symbol index: {error}")),
+            }
+            let index_results: Vec<Result<usize, String>> = self.tabs[index].index_events.try_iter().collect();
+            for result in index_results {
+                match result {
+                    Ok(count) => self.tabs[index].indexed_files = Some(count),
+                    Err(error) => self.report_error(format!("symbol index: {error}")),
+                }
             }
         }
+        self.drain_update_events();
     }
 
-    fn drain_worker_events(&mut self) {
-        let events = match &self.workspace {
-            Some(workspace) => workspace.worker.drain_events(),
-            None => return,
-        };
-        for event in events {
-            match event {
-                WorkerEvent::Snapshot(snapshot) => self.apply_snapshot(snapshot),
-                WorkerEvent::Failed(error) => self.report_error(error),
+    fn drain_update_events(&mut self) {
+        for result in self.update.check.try_iter().collect::<Vec<_>>() {
+            if let Ok(release) = result {
+                self.update.available = release;
+            }
+        }
+        let finished = self
+            .update
+            .install
+            .as_ref()
+            .and_then(|install| install.try_iter().next());
+        if let Some(result) = finished {
+            self.update.install = None;
+            match result {
+                Ok(()) => {
+                    let version = self.update.available.as_ref().map(|release| release.version.clone());
+                    self.update.installed = version;
+                }
+                Err(error) => self.report_error(error),
             }
         }
     }
@@ -232,6 +341,10 @@ impl DiffViewerApp {
             Command::Discard => self.pending_discard = self.selected_file(),
             Command::ClosePeek => self.close_peek(),
             Command::PeekBack => self.peek_back(),
+            Command::SwitchTab(index) => self.activate_tab(ctx, index),
+            Command::NextTab => self.cycle_tab(ctx, 1),
+            Command::PrevTab => self.cycle_tab(ctx, -1),
+            Command::CloseTab => self.close_tab(ctx, self.active),
             Command::Unfocus => ctx.memory_mut(|memory| {
                 if let Some(id) = memory.focused() {
                     memory.surrender_focus(id);
@@ -241,32 +354,32 @@ impl DiffViewerApp {
     }
 
     fn selected_path(&self) -> Option<PathBuf> {
-        self.workspace.as_ref().and_then(|workspace| workspace.selected.clone())
+        self.tab().and_then(|workspace| workspace.selected.clone())
     }
 
     fn selected_file(&self) -> Option<ChangedFile> {
-        let workspace = self.workspace.as_ref()?;
+        let workspace = self.tab()?;
         let path = workspace.selected.as_ref()?;
         workspace.snapshot.find(path).cloned()
     }
 
     fn revalidate_selection(&mut self) {
         let hide_tests = self.hide_tests;
-        if let Some(workspace) = self.workspace.as_mut() {
+        for workspace in &mut self.tabs {
             workspace.revalidate_selection(hide_tests);
         }
     }
 
     fn sync_collapse(&mut self) {
         let collapsed = self.collapse_unchanged;
-        if let Some(workspace) = self.workspace.as_mut() {
+        for workspace in &mut self.tabs {
             workspace.view.collapsed = collapsed;
         }
     }
 
     fn move_selection(&mut self, delta: isize) {
         let hide_tests = self.hide_tests;
-        let Some(workspace) = self.workspace.as_mut() else {
+        let Some(workspace) = self.tab_mut() else {
             return;
         };
         let paths: Vec<PathBuf> = visible_files(&workspace.snapshot, hide_tests)
@@ -288,7 +401,7 @@ impl DiffViewerApp {
 
     fn advance_to_next_unstaged(&mut self, current: &Path) {
         let hide_tests = self.hide_tests;
-        let Some(workspace) = self.workspace.as_mut() else {
+        let Some(workspace) = self.tab_mut() else {
             return;
         };
         let files: Vec<(PathBuf, StageState)> = visible_files(&workspace.snapshot, hide_tests)
@@ -310,7 +423,7 @@ impl DiffViewerApp {
     }
 
     fn toggle_stage(&mut self, path: &Path) {
-        let Some(workspace) = self.workspace.as_mut() else {
+        let Some(workspace) = self.tab_mut() else {
             return;
         };
         let Some(file) = workspace.snapshot.find(path).cloned() else {
@@ -332,7 +445,7 @@ impl DiffViewerApp {
     }
 
     fn stage_all(&mut self) {
-        let result = match self.workspace.as_mut() {
+        let result = match self.tab_mut() {
             Some(workspace) => {
                 let result = workspace.service.stage_all();
                 if result.is_ok() {
@@ -349,7 +462,7 @@ impl DiffViewerApp {
     }
 
     fn unstage_all(&mut self) {
-        let result = match self.workspace.as_mut() {
+        let result = match self.tab_mut() {
             Some(workspace) => {
                 let result = workspace.service.unstage_all();
                 if result.is_ok() {
@@ -367,7 +480,7 @@ impl DiffViewerApp {
 
     fn discard(&mut self, file: &ChangedFile) {
         let hide_tests = self.hide_tests;
-        let result = match self.workspace.as_mut() {
+        let result = match self.tab_mut() {
             Some(workspace) => {
                 let result = workspace.service.discard(file);
                 if result.is_ok() {
@@ -387,29 +500,24 @@ impl DiffViewerApp {
     }
 
     fn commit(&mut self) {
-        let message = self.commit_message.trim().to_string();
+        let Some(workspace) = self.tab_mut() else {
+            return;
+        };
+        let message = workspace.commit_message.trim().to_string();
         if message.is_empty() {
             self.focus_commit = true;
             self.report_error("Enter a commit message first".to_string());
             return;
         }
-        let result = match self.workspace.as_mut() {
-            Some(workspace) if workspace.snapshot.staged_count() == 0 => {
-                self.report_error("Nothing is staged".to_string());
-                return;
-            }
-            Some(workspace) => {
-                let result = workspace.service.commit(&message);
-                if result.is_ok() {
-                    workspace.worker.request_refresh();
-                }
-                result
-            }
-            None => return,
-        };
+        if workspace.snapshot.staged_count() == 0 {
+            self.report_error("Nothing is staged".to_string());
+            return;
+        }
+        let result = workspace.service.commit(&message);
         match result {
             Ok(summary) => {
-                self.commit_message.clear();
+                workspace.commit_message.clear();
+                workspace.worker.request_refresh();
                 self.report_info(format!("Committed {summary}"));
             }
             Err(error) => self.report_error(error.to_string()),
@@ -417,7 +525,7 @@ impl DiffViewerApp {
     }
 
     fn request_refresh(&mut self) {
-        if let Some(workspace) = self.workspace.as_mut() {
+        if let Some(workspace) = self.tab_mut() {
             workspace.diffs.clear();
             workspace.rows_key = None;
             workspace.worker.request_refresh();
@@ -426,8 +534,7 @@ impl DiffViewerApp {
 
     fn pick_repo(&mut self, ctx: &Context) {
         let start = self
-            .workspace
-            .as_ref()
+            .tab()
             .map(|workspace| workspace.service.root().to_path_buf())
             .or_else(dirs::home_dir)
             .unwrap_or_else(|| PathBuf::from("."));
@@ -436,8 +543,16 @@ impl DiffViewerApp {
         }
     }
 
+    fn start_update(&mut self, ctx: &Context) {
+        if self.update.install.is_some() {
+            return;
+        }
+        let wake = ctx.clone();
+        self.update.install = Some(updates::spawn_install(Box::new(move || wake.request_repaint())));
+    }
+
     fn jump_hunk(&mut self, delta: isize) {
-        let Some(workspace) = self.workspace.as_mut() else {
+        let Some(workspace) = self.tab_mut() else {
             return;
         };
         let Some(path) = &workspace.selected else {
@@ -464,7 +579,8 @@ impl DiffViewerApp {
     }
 
     fn ensure_diff_loaded(&mut self) {
-        let Some(workspace) = self.workspace.as_mut() else {
+        let active = self.active;
+        let Some(workspace) = self.tabs.get_mut(active) else {
             return;
         };
         let Some(path) = workspace.selected.clone() else {
@@ -495,7 +611,7 @@ impl DiffViewerApp {
     }
 
     fn ensure_rows(&mut self) {
-        let Some(workspace) = self.workspace.as_mut() else {
+        let Some(workspace) = self.tab_mut() else {
             return;
         };
         let Some(path) = workspace.selected.clone() else {
@@ -531,7 +647,7 @@ impl DiffViewerApp {
     }
 
     fn open_definition(&mut self, file: PathBuf, hit: WordHit, chain: bool) {
-        let Some(workspace) = self.workspace.as_mut() else {
+        let Some(workspace) = self.tab_mut() else {
             return;
         };
         let symbols = workspace.service.definitions(&file, &hit.word, hit.attribute_access);
@@ -551,7 +667,8 @@ impl DiffViewerApp {
     }
 
     fn ensure_peek_loaded(&mut self) {
-        let Some(workspace) = self.workspace.as_mut() else {
+        let active = self.active;
+        let Some(workspace) = self.tabs.get_mut(active) else {
             return;
         };
         let Some(symbol) = workspace
@@ -576,13 +693,13 @@ impl DiffViewerApp {
     }
 
     fn close_peek(&mut self) {
-        if let Some(workspace) = self.workspace.as_mut() {
+        if let Some(workspace) = self.tab_mut() {
             workspace.peek = None;
         }
     }
 
     fn peek_back(&mut self) {
-        let Some(workspace) = self.workspace.as_mut() else {
+        let Some(workspace) = self.tab_mut() else {
             return;
         };
         let went_back = workspace.peek.as_mut().is_some_and(PeekState::back);
@@ -592,7 +709,7 @@ impl DiffViewerApp {
     }
 
     fn open_peek_in_editor(&mut self) {
-        let Some(workspace) = self.workspace.as_ref() else {
+        let Some(workspace) = self.tab() else {
             return;
         };
         let Some(symbol) = workspace.peek.as_ref().and_then(|peek| peek.symbol().cloned()) else {
@@ -631,7 +748,7 @@ impl DiffViewerApp {
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.add_space(6.0);
-                    match &self.workspace {
+                    match self.tabs.get(self.active) {
                         Some(workspace) => {
                             ui.label(RichText::new(workspace.service.repo_name()).strong());
                             ui.label(RichText::new(format!("on {}", workspace.snapshot.branch)).color(self.theme.text_dim));
@@ -641,7 +758,7 @@ impl DiffViewerApp {
                         }
                     }
                     ui.separator();
-                    if ui.button("Open…").on_hover_text("⌘O").clicked() {
+                    if ui.button("Open…").on_hover_text(keymap::key_label("T")).clicked() {
                         actions.push(TopBarAction::OpenRepo);
                     }
                     if ui.button("Refresh").on_hover_text("r").clicked() {
@@ -659,10 +776,10 @@ impl DiffViewerApp {
                         if ui.button("Unstage all").clicked() {
                             actions.push(TopBarAction::UnstageAll);
                         }
-                        if ui.button("Stage all").on_hover_text("⌘⇧A").clicked() {
+                        if ui.button("Stage all").on_hover_text(keymap::key_label("⇧A")).clicked() {
                             actions.push(TopBarAction::StageAll);
                         }
-                        if let Some(workspace) = &self.workspace {
+                        if let Some(workspace) = self.tabs.get(self.active) {
                             let summary = format!(
                                 "{} files · {} staged",
                                 workspace.snapshot.total(),
@@ -685,7 +802,39 @@ impl DiffViewerApp {
         }
     }
 
+    fn show_tab_bar(&mut self, ui: &mut Ui) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        let ctx = ui.ctx().clone();
+        let infos: Vec<TabInfo> = self
+            .tabs
+            .iter()
+            .map(|workspace| TabInfo {
+                name: workspace.service.repo_name(),
+                root: workspace.service.root().to_path_buf(),
+                changes: workspace.snapshot.total(),
+            })
+            .collect();
+        let mut action = None;
+        Panel::top(Id::new("tab_bar"))
+            .exact_size(TAB_BAR_HEIGHT)
+            .show_separator_line(false)
+            .frame(Frame::NONE.fill(self.theme.panel))
+            .show(ui, |ui| {
+                action = tab_bar::show(ui, &infos, self.active, &self.theme);
+            });
+        match action {
+            Some(TabAction::Select(index)) => self.activate_tab(&ctx, index),
+            Some(TabAction::Close(index)) => self.close_tab(&ctx, index),
+            Some(TabAction::Open) => self.pick_repo(&ctx),
+            None => {}
+        }
+    }
+
     fn show_bottom_bar(&mut self, ui: &mut Ui) {
+        let ctx = ui.ctx().clone();
+        let mut start_update = false;
         Panel::bottom(Id::new("status_bar"))
             .exact_size(STATUS_BAR_HEIGHT)
             .show(ui, |ui| {
@@ -697,17 +846,17 @@ impl DiffViewerApp {
                             ui.label(RichText::new(&status.text).color(color).small());
                         }
                         None => {
-                            ui.label(RichText::new(keymap::HINTS).color(self.theme.text_faint).small());
+                            ui.label(RichText::new(keymap::hints()).color(self.theme.text_faint).small());
                         }
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.add_space(6.0);
                         ui.label(
-                            RichText::new(format!("config: {}", self.config.path.display()))
+                            RichText::new(format!("v{CURRENT_VERSION} · config: {}", self.config.path.display()))
                                 .color(self.theme.text_faint)
                                 .small(),
                         );
-                        if let Some(workspace) = &self.workspace {
+                        if let Some(workspace) = self.tabs.get(self.active) {
                             let index_label = match workspace.indexed_files {
                                 Some(count) => format!("{count} py files indexed"),
                                 None => "indexing symbols…".to_string(),
@@ -715,25 +864,30 @@ impl DiffViewerApp {
                             ui.label(RichText::new(index_label).color(self.theme.text_faint).small());
                             ui.separator();
                         }
+                        start_update = show_update_notice(ui, &self.update, &self.theme);
                     });
                 });
             });
+        if start_update {
+            self.start_update(&ctx);
+        }
     }
 
     fn show_left_panel(&mut self, ui: &mut Ui) {
         let mut list_action = None;
         let mut commit_action = None;
         let hide_tests = self.hide_tests;
+        let active = self.active;
         let focus_commit = std::mem::take(&mut self.focus_commit);
         Panel::left(Id::new("file_panel"))
             .resizable(true)
             .default_size(FILE_PANEL_DEFAULT_WIDTH)
             .size_range(FILE_PANEL_MIN_WIDTH..=FILE_PANEL_MAX_WIDTH)
             .show(ui, |ui| {
-                let Some(workspace) = self.workspace.as_mut() else {
+                let Some(workspace) = self.tabs.get_mut(active) else {
                     ui.add_space(24.0);
                     ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("Open a git repository with ⌘O").color(self.theme.text_dim));
+                        ui.label(RichText::new(format!("Open a git repository with {}", keymap::key_label("T"))).color(self.theme.text_dim));
                     });
                     return;
                 };
@@ -742,7 +896,7 @@ impl DiffViewerApp {
                     .resizable(false)
                     .show_separator_line(true)
                     .show(ui, |ui| {
-                        commit_action = commit_box::show(ui, &mut self.commit_message, staged_count, focus_commit, &self.theme);
+                        commit_action = commit_box::show(ui, &mut workspace.commit_message, staged_count, focus_commit, &self.theme);
                     });
                 CentralPanel::default()
                     .frame(Frame::NONE)
@@ -760,7 +914,7 @@ impl DiffViewerApp {
             });
         match list_action {
             Some(FileListAction::Select(path)) => {
-                if let Some(workspace) = self.workspace.as_mut() {
+                if let Some(workspace) = self.tab_mut() {
                     workspace.select(Some(path));
                 }
             }
@@ -777,11 +931,12 @@ impl DiffViewerApp {
         let mut peek_action = None;
         let mut definition_request: Option<(PathBuf, WordHit)> = None;
         let editor_name = editor::editor_display_name(&self.config.editor_command);
+        let active = self.active;
         CentralPanel::default()
             .frame(Frame::NONE.fill(self.theme.bg))
             .show(ui, |ui| {
-                let Some(workspace) = self.workspace.as_mut() else {
-                    diff_view::centered_message(ui, "Open a git repository (⌘O)", &self.theme);
+                let Some(workspace) = self.tabs.get_mut(active) else {
+                    diff_view::centered_message(ui, &format!("Open a git repository ({})", keymap::key_label("T")), &self.theme);
                     return;
                 };
                 let Some(path) = workspace.selected.clone() else {
@@ -828,14 +983,13 @@ impl DiffViewerApp {
             Some(PeekAction::Close) => self.close_peek(),
             Some(PeekAction::Back) => self.peek_back(),
             Some(PeekAction::Choose(index)) => {
-                if let Some(peek) = self.workspace.as_mut().and_then(|workspace| workspace.peek.as_mut()) {
+                if let Some(peek) = self.tab_mut().and_then(|workspace| workspace.peek.as_mut()) {
                     peek.choose(index);
                 }
             }
             Some(PeekAction::Navigate(hit)) => {
                 let origin = self
-                    .workspace
-                    .as_ref()
+                    .tab()
                     .and_then(|workspace| workspace.peek.as_ref())
                     .and_then(|peek| peek.source.as_ref())
                     .map(|source| source.path.clone());
@@ -903,14 +1057,14 @@ impl DiffViewerApp {
 impl eframe::App for DiffViewerApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.drain_worker_events();
-        self.drain_index_events();
+        self.drain_background_events(&ctx);
         if self.pending_discard.is_none() {
             for command in keymap::poll(&ctx) {
                 self.dispatch(&ctx, command);
             }
         }
         self.expire_status(&ctx);
+        self.show_tab_bar(ui);
         self.show_top_bar(ui);
         self.show_bottom_bar(ui);
         self.show_left_panel(ui);
@@ -960,6 +1114,31 @@ impl Workspace {
         }
         self.snapshot.groups.retain(|group| !group.files.is_empty());
     }
+}
+
+fn show_update_notice(ui: &mut Ui, update: &UpdateState, theme: &Theme) -> bool {
+    if let Some(version) = &update.installed {
+        ui.label(RichText::new(format!("Updated to v{version} — restart diffviewer")).color(theme.added_fg).small());
+        ui.separator();
+        return false;
+    }
+    let Some(release) = &update.available else {
+        return false;
+    };
+    let mut start = false;
+    if update.install.is_some() {
+        ui.label(RichText::new("updating…").color(theme.text_dim).small());
+        ui.ctx().request_repaint_after(Duration::from_millis(250));
+    } else if update.homebrew {
+        ui.label(RichText::new(format!("v{} available · brew upgrade diffviewer", release.version)).color(theme.modified_fg).small());
+    } else {
+        if ui.small_button("Update").on_hover_text(&release.url).clicked() {
+            start = true;
+        }
+        ui.label(RichText::new(format!("v{} available", release.version)).color(theme.modified_fg).small());
+    }
+    ui.separator();
+    start
 }
 
 fn show_diff_header(ui: &mut egui::Ui, file: &ChangedFile, hunk_count: Option<usize>, current_hunk: Option<usize>, theme: &Theme) -> Option<HeaderAction> {
@@ -1025,6 +1204,7 @@ fn first_unstaged_or_first(snapshot: &RepoSnapshot, hide_tests: bool) -> Option<
         .map(|file| file.path.clone())
 }
 
+const TAB_BAR_HEIGHT: f32 = 32.0;
 const TOP_BAR_HEIGHT: f32 = 38.0;
 const STATUS_BAR_HEIGHT: f32 = 24.0;
 const DIFF_HEADER_HEIGHT: f32 = 38.0;

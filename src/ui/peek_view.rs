@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use egui::{Align, Button, Color32, CursorIcon, Layout, RichText, ScrollArea, Sense, TextStyle, Ui, vec2};
 
 use super::code_line::{GUTTER_PADDING, LineStyle, PointerState, ROW_PADDING_Y, TEXT_PADDING, WordHit, paint_code_line};
+use super::keymap;
 use super::theme::Theme;
 use crate::application::review_service::PeekSource;
 use crate::domain::symbols::Symbol;
@@ -149,7 +150,7 @@ fn header(ui: &mut Ui, state: &PeekState, editor_name: &str, theme: &Theme, acti
             if ui.button(format!("Open in {editor_name}")).clicked() {
                 *action = Some(PeekAction::OpenInEditor);
             }
-            if ui.add_enabled(state.has_history(), Button::new("Back  ⌘[")).clicked() {
+            if ui.add_enabled(state.has_history(), Button::new(format!("Back  {}", keymap::key_label("[")))).clicked() {
                 *action = Some(PeekAction::Back);
             }
         });

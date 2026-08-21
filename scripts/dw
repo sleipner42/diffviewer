@@ -1,9 +1,20 @@
 #!/bin/sh
 set -eu
 
+install_url="https://raw.githubusercontent.com/sleipner42/diffviewer/main/install.sh"
+
+case "${1:-}" in
+  update)
+    exec sh -c "curl -fsSL $install_url | sh"
+    ;;
+  -V|--version|-h|--help)
+    exec diffviewer "$1"
+    ;;
+esac
+
 binary="$(command -v diffviewer 2>/dev/null || true)"
 if [ -z "$binary" ]; then
-  echo "dw: diffviewer is not installed; run scripts/install.sh" >&2
+  echo "dw: diffviewer is not installed; run: curl -fsSL $install_url | sh" >&2
   exit 1
 fi
 

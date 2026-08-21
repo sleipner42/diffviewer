@@ -18,6 +18,10 @@ pub enum Command {
     Unfocus,
     ClosePeek,
     PeekBack,
+    SwitchTab(usize),
+    NextTab,
+    PrevTab,
+    CloseTab,
 }
 
 pub fn poll(ctx: &Context) -> Vec<Command> {
@@ -45,15 +49,40 @@ pub fn poll(ctx: &Context) -> Vec<Command> {
     commands
 }
 
-pub const HINTS: &str =
-    "j/k files · s stage · n/p hunks · e collapse · t tests · d discard · c commit message · ⌘↩ commit · ⌘O open · ⌘click definition";
+pub fn hints() -> String {
+    let modifier = modifier_symbol();
+    format!(
+        "j/k files · s stage · n/p hunks · e collapse · t tests · d discard · c commit message · {modifier}↩ commit · {modifier}T open · {modifier}1-9 tabs · {modifier}W close tab · {modifier}click definition"
+    )
+}
+
+pub fn key_label(key: &str) -> String {
+    format!("{}{key}", modifier_symbol())
+}
+
+fn modifier_symbol() -> &'static str {
+    if cfg!(target_os = "macos") { "⌘" } else { "Ctrl+" }
+}
 
 const GLOBAL_BINDINGS: &[(Modifiers, Key, Command)] = &[
     (Modifiers::COMMAND, Key::Enter, Command::Commit),
     (Modifiers::COMMAND, Key::O, Command::OpenRepo),
+    (Modifiers::COMMAND, Key::T, Command::OpenRepo),
+    (Modifiers::COMMAND, Key::W, Command::CloseTab),
     (Modifiers::COMMAND, Key::R, Command::Refresh),
     (Modifiers::COMMAND, Key::OpenBracket, Command::PeekBack),
     (Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::A, Command::StageAll),
+    (Modifiers::CTRL, Key::Tab, Command::NextTab),
+    (Modifiers::CTRL.plus(Modifiers::SHIFT), Key::Tab, Command::PrevTab),
+    (Modifiers::COMMAND, Key::Num1, Command::SwitchTab(0)),
+    (Modifiers::COMMAND, Key::Num2, Command::SwitchTab(1)),
+    (Modifiers::COMMAND, Key::Num3, Command::SwitchTab(2)),
+    (Modifiers::COMMAND, Key::Num4, Command::SwitchTab(3)),
+    (Modifiers::COMMAND, Key::Num5, Command::SwitchTab(4)),
+    (Modifiers::COMMAND, Key::Num6, Command::SwitchTab(5)),
+    (Modifiers::COMMAND, Key::Num7, Command::SwitchTab(6)),
+    (Modifiers::COMMAND, Key::Num8, Command::SwitchTab(7)),
+    (Modifiers::COMMAND, Key::Num9, Command::SwitchTab(8)),
 ];
 
 const PLAIN_BINDINGS: &[(Key, Command)] = &[

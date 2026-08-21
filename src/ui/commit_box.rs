@@ -1,5 +1,6 @@
 use egui::{Button, RichText, TextStyle, Ui};
 
+use super::keymap;
 use super::theme::Theme;
 
 pub enum CommitAction {
@@ -18,7 +19,7 @@ pub fn show(
     let editor = egui::TextEdit::multiline(message)
         .desired_rows(MESSAGE_ROWS)
         .desired_width(f32::INFINITY)
-        .hint_text("Commit message  (⌘↩ to commit)")
+        .hint_text(format!("Commit message  ({} to commit)", keymap::key_label("↩")))
         .font(TextStyle::Body);
     let response = ui.add(editor);
     if request_focus {

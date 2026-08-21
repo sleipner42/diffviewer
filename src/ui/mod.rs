@@ -6,4 +6,5 @@ mod file_list;
 mod keymap;
 mod peek_view;
 mod rendered;
+mod tab_bar;
 mod theme;
