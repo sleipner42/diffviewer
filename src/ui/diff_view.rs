@@ -14,7 +14,7 @@ pub struct DiffViewState {
     pub expanded_gaps: HashSet<usize>,
     pub scroll_to_view_row: Option<usize>,
     pub current_hunk: Option<usize>,
-    pub scroll_x: [f32; 2],
+    pub scroll_x: f32,
 }
 
 impl DiffViewState {
@@ -24,7 +24,7 @@ impl DiffViewState {
             expanded_gaps: HashSet::new(),
             scroll_to_view_row: None,
             current_hunk: None,
-            scroll_x: [0.0; 2],
+            scroll_x: 0.0,
         }
     }
 
@@ -32,7 +32,7 @@ impl DiffViewState {
         self.expanded_gaps.clear();
         self.scroll_to_view_row = None;
         self.current_hunk = None;
-        self.scroll_x = [0.0; 2];
+        self.scroll_x = 0.0;
     }
 }
 
@@ -75,8 +75,12 @@ struct Layout {
 }
 
 impl Layout {
-    fn max_scroll(&self, side: usize) -> f32 {
-        (self.content_width[side] - self.pane_width).max(0.0)
+    fn widest_content(&self) -> f32 {
+        self.content_width[0].max(self.content_width[1])
+    }
+
+    fn max_scroll(&self) -> f32 {
+        (self.widest_content() - self.pane_width).max(0.0)
     }
 
     fn side_offset(&self, side: usize) -> f32 {
@@ -166,31 +170,24 @@ fn show_rows(
 }
 
 fn route_horizontal_scroll(ui: &mut Ui, viewport: Rect, layout: &Layout, state: &mut DiffViewState) {
-    for side in 0..2 {
-        state.scroll_x[side] = state.scroll_x[side].clamp(0.0, layout.max_scroll(side));
-    }
+    state.scroll_x = state.scroll_x.clamp(0.0, layout.max_scroll());
     let (hover, delta) = ui.input(|input| (input.pointer.hover_pos(), input.smooth_scroll_delta));
-    if delta.x == 0.0 {
+    if delta.x == 0.0 || !hover.is_some_and(|pos| viewport.contains(pos)) {
         return;
     }
-    let Some(pos) = hover.filter(|pos| viewport.contains(*pos)) else {
-        return;
-    };
-    let split_x = viewport.left() + layout.gutter_width + layout.pane_width + DIVIDER_WIDTH / 2.0;
-    let side = usize::from(pos.x >= split_x);
-    let next = (state.scroll_x[side] - delta.x).clamp(0.0, layout.max_scroll(side));
-    if next != state.scroll_x[side] {
-        state.scroll_x[side] = next;
+    let next = (state.scroll_x - delta.x).clamp(0.0, layout.max_scroll());
+    if next != state.scroll_x {
+        state.scroll_x = next;
         ui.input_mut(|input| input.smooth_scroll_delta.x = 0.0);
     }
 }
 
 fn paint_horizontal_scrollbars(ui: &mut Ui, inner_rect: Rect, layout: &Layout, state: &mut DiffViewState, theme: &Theme) {
+    let max = layout.max_scroll();
+    if max <= 0.0 {
+        return;
+    }
     for side in 0..2 {
-        let max = layout.max_scroll(side);
-        if max <= 0.0 {
-            continue;
-        }
         let track_left = inner_rect.left() + layout.side_offset(side) + layout.gutter_width;
         let track_right = (track_left + layout.pane_width).min(inner_rect.right());
         let track_width = track_right - track_left;
@@ -198,14 +195,14 @@ fn paint_horizontal_scrollbars(ui: &mut Ui, inner_rect: Rect, layout: &Layout, s
             continue;
         }
         let y = inner_rect.bottom() - SCROLLBAR_MARGIN - SCROLLBAR_THICKNESS;
-        let thumb_width = (track_width * layout.pane_width / layout.content_width[side]).max(MIN_THUMB_WIDTH);
+        let thumb_width = (track_width * layout.pane_width / layout.widest_content()).max(MIN_THUMB_WIDTH);
         let travel = track_width - thumb_width;
-        let thumb_x = track_left + travel * (state.scroll_x[side] / max);
+        let thumb_x = track_left + travel * (state.scroll_x / max);
         let thumb = Rect::from_min_size(pos2(thumb_x, y), vec2(thumb_width, SCROLLBAR_THICKNESS));
         let response = ui.interact(thumb.expand2(vec2(0.0, 4.0)), ui.id().with(("hscroll", side)), Sense::drag());
         if response.dragged() && travel > 0.0 {
             let delta = response.drag_delta().x / travel * max;
-            state.scroll_x[side] = (state.scroll_x[side] + delta).clamp(0.0, max);
+            state.scroll_x = (state.scroll_x + delta).clamp(0.0, max);
         }
         let track = Rect::from_min_size(pos2(track_left, y), vec2(track_width, SCROLLBAR_THICKNESS));
         let thumb_color = if response.hovered() || response.dragged() { theme.text_dim } else { theme.text_faint };
@@ -224,7 +221,7 @@ fn paint_line_row(
     layout: &Layout,
     theme: &Theme,
     pointer: Option<PointerState>,
-    scroll_x: [f32; 2],
+    scroll_x: f32,
 ) -> Option<WordHit> {
     let (rect, response) = ui.allocate_exact_size(vec2(layout.total_width, layout.row_height), Sense::click());
     let side_size = vec2(layout.gutter_width + layout.pane_width, layout.row_height);
@@ -232,8 +229,8 @@ fn paint_line_row(
     let right_rect = Rect::from_min_size(pos2(rect.left() + layout.side_offset(1), rect.top()), side_size);
     let divider = Rect::from_min_max(pos2(left_rect.right(), rect.top()), pos2(right_rect.left(), rect.bottom()));
     ui.painter().rect_filled(divider, 0.0, theme.border);
-    let left_hit = paint_side(ui, left_rect, row.left.as_ref(), side_colors(row.kind, Side::Left, theme), left_spans, layout, theme, pointer, scroll_x[0]);
-    let right_hit = paint_side(ui, right_rect, row.right.as_ref(), side_colors(row.kind, Side::Right, theme), right_spans, layout, theme, pointer, scroll_x[1]);
+    let left_hit = paint_side(ui, left_rect, row.left.as_ref(), side_colors(row.kind, Side::Left, theme), left_spans, layout, theme, pointer, scroll_x);
+    let right_hit = paint_side(ui, right_rect, row.right.as_ref(), side_colors(row.kind, Side::Right, theme), right_spans, layout, theme, pointer, scroll_x);
     let hit = left_hit.or(right_hit);
     if hit.is_some() {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
