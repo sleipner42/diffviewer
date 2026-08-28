@@ -139,6 +139,7 @@ mod tests {
             kind: ChangeKind::Modified,
             stage: StageState::Unstaged,
             stats: LineStats::default(),
+            content_id: None,
         }
     }
 

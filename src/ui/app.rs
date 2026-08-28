@@ -25,7 +25,7 @@ use crate::infra::editor;
 use crate::infra::git_cli::GitCli;
 use crate::infra::highlight::Highlighter;
 use crate::infra::index_worker::spawn_index_build;
-use crate::infra::single_instance;
+use crate::infra::single_instance::{self, OpenRequest};
 use crate::infra::status_worker::{StatusWorker, WorkerEvent};
 use crate::infra::updates::{self, CURRENT_VERSION, ReleaseInfo};
 
@@ -35,7 +35,7 @@ pub struct DiffViewerApp {
     config: AppConfig,
     tabs: Vec<Workspace>,
     active: usize,
-    remote_opens: Receiver<PathBuf>,
+    remote_opens: Receiver<OpenRequest>,
     update: UpdateState,
     hide_tests: bool,
     collapse_unchanged: bool,
@@ -105,7 +105,7 @@ enum DiscardDecision {
 }
 
 impl DiffViewerApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, config: AppConfig, start_dir: PathBuf, listener: Option<UnixListener>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, config: AppConfig, request: OpenRequest, listener: Option<UnixListener>) -> Self {
         let theme = Theme::dark();
         theme.apply(&cc.egui_ctx);
         let remote_opens = match listener {
@@ -146,19 +146,29 @@ impl DiffViewerApp {
         if let Some(error) = app.config.load_error.clone() {
             app.report_error(error);
         }
-        app.open_repo(&cc.egui_ctx, &start_dir);
+        app.open_repo(&cc.egui_ctx, &request);
         app
     }
 
-    fn open_repo(&mut self, ctx: &Context, path: &Path) {
-        let git = match GitCli::discover(path) {
+    fn open_repo(&mut self, ctx: &Context, request: &OpenRequest) {
+        let opened = match request.range.clone() {
+            Some(spec) => GitCli::discover_range(&request.dir, spec),
+            None => GitCli::discover(&request.dir),
+        };
+        let git = match opened {
             Ok(git) => git,
             Err(error) => {
-                self.report_error(error.to_string());
+                self.report_error(format!("{error:#}"));
                 return;
             }
         };
-        if let Some(index) = self.tabs.iter().position(|tab| tab.service.root() == git.root()) {
+        // The same repo opened at a different range is a different review, so the
+        // mode is part of the tab identity.
+        let existing = self
+            .tabs
+            .iter()
+            .position(|tab| tab.service.root() == git.root() && tab.service.mode() == git.mode());
+        if let Some(index) = existing {
             self.activate_tab(ctx, index);
             return;
         }
@@ -195,7 +205,7 @@ impl DiffViewerApp {
             commit_message: String::new(),
         });
         let index = self.tabs.len() - 1;
-        self.apply_snapshot(index, snapshot);
+        self.apply_snapshot(ctx, index, snapshot);
         self.activate_tab(ctx, index);
     }
 
@@ -232,7 +242,7 @@ impl DiffViewerApp {
 
     fn sync_title(&self, ctx: &Context) {
         let title = match self.tabs.get(self.active) {
-            Some(tab) => format!("{} — diffviewer", tab.service.repo_name()),
+            Some(tab) => format!("{} — diffviewer", Self::tab_label(tab)),
             None => "diffviewer".to_string(),
         };
         ctx.send_viewport_cmd(ViewportCommand::Title(title));
@@ -242,15 +252,36 @@ impl DiffViewerApp {
         self.tabs.get(self.active)
     }
 
+    /// True when the active tab reviews a committed range rather than the tree.
+    fn is_range(&self) -> bool {
+        self.tab().is_some_and(|workspace| workspace.service.is_range())
+    }
+
+    /// A repo can be open both as a working tree and as one or more ranges, so
+    /// tabs and the title carry the range to stay tellable apart.
+    fn tab_label(workspace: &Workspace) -> String {
+        let name = workspace.service.repo_name();
+        match workspace.service.mode().range() {
+            Some(spec) => format!("{name} · {}", spec.label()),
+            None => name,
+        }
+    }
+
     fn tab_mut(&mut self) -> Option<&mut Workspace> {
         self.tabs.get_mut(self.active)
     }
 
-    fn apply_snapshot(&mut self, index: usize, snapshot: RepoSnapshot) {
+    fn apply_snapshot(&mut self, ctx: &Context, index: usize, snapshot: RepoSnapshot) {
         let hide_tests = self.hide_tests;
         let Some(workspace) = self.tabs.get_mut(index) else {
             return;
         };
+        // A range's content only changes when its head moves — amend, fixup, new
+        // commit. Rebuild the symbol index off-thread when that happens, since
+        // the cheap per-file refresh below is skipped in range mode.
+        let head_moved = workspace.service.is_range()
+            && workspace.snapshot.head_id.is_some()
+            && workspace.snapshot.head_id != snapshot.head_id;
         workspace.diffs.retain(|path, rendered| {
             snapshot
                 .find(path)
@@ -265,18 +296,24 @@ impl DiffViewerApp {
         workspace.service.refresh_symbols(touched.iter().map(PathBuf::as_path));
         workspace.snapshot = snapshot;
         workspace.revalidate_selection(hide_tests);
+        if head_moved {
+            let wake = ctx.clone();
+            workspace.indexed_files = None;
+            workspace.index_events =
+                spawn_index_build(Arc::clone(&workspace.service), Box::new(move || wake.request_repaint()));
+        }
     }
 
     fn drain_background_events(&mut self, ctx: &Context) {
-        let remote: Vec<PathBuf> = self.remote_opens.try_iter().collect();
-        for path in remote {
-            self.open_repo(ctx, &path);
+        let remote: Vec<OpenRequest> = self.remote_opens.try_iter().collect();
+        for request in remote {
+            self.open_repo(ctx, &request);
         }
         for index in 0..self.tabs.len() {
             let events = self.tabs[index].worker.drain_events();
             for event in events {
                 match event {
-                    WorkerEvent::Snapshot(snapshot) => self.apply_snapshot(index, snapshot),
+                    WorkerEvent::Snapshot(snapshot) => self.apply_snapshot(ctx, index, snapshot),
                     WorkerEvent::Failed(error) => self.report_error(error),
                 }
             }
@@ -336,8 +373,13 @@ impl DiffViewerApp {
             Command::Refresh => self.request_refresh(),
             Command::StageAll => self.stage_all(),
             Command::OpenRepo => self.pick_repo(ctx),
+            Command::Commit if self.is_range() => {}
             Command::Commit => self.commit(),
+            Command::FocusCommit if self.is_range() => {}
             Command::FocusCommit => self.focus_commit = true,
+            Command::Discard if self.is_range() => {
+                self.report_error("Range reviews are read-only".to_string())
+            }
             Command::Discard => self.pending_discard = self.selected_file(),
             Command::ClosePeek => self.close_peek(),
             Command::PeekBack => self.peek_back(),
@@ -539,7 +581,7 @@ impl DiffViewerApp {
             .or_else(dirs::home_dir)
             .unwrap_or_else(|| PathBuf::from("."));
         if let Some(path) = rfd::FileDialog::new().set_directory(start).pick_folder() {
-            self.open_repo(ctx, &path);
+            self.open_repo(ctx, &OpenRequest { dir: path, range: None });
         }
     }
 
@@ -751,7 +793,8 @@ impl DiffViewerApp {
                     match self.tabs.get(self.active) {
                         Some(workspace) => {
                             ui.label(RichText::new(workspace.service.repo_name()).strong());
-                            ui.label(RichText::new(format!("on {}", workspace.snapshot.branch)).color(self.theme.text_dim));
+                            let prefix = if workspace.service.is_range() { "reviewing" } else { "on" };
+                            ui.label(RichText::new(format!("{prefix} {}", workspace.snapshot.branch)).color(self.theme.text_dim));
                         }
                         None => {
                             ui.label(RichText::new("No repository").color(self.theme.text_dim));
@@ -773,15 +816,22 @@ impl DiffViewerApp {
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.add_space(6.0);
-                        if ui.button("Unstage all").clicked() {
+                        let range = self.tabs.get(self.active).is_some_and(|tab| tab.service.is_range());
+                        let (clear, mark) = if range {
+                            ("Clear marks", "Mark all read")
+                        } else {
+                            ("Unstage all", "Stage all")
+                        };
+                        if ui.button(clear).clicked() {
                             actions.push(TopBarAction::UnstageAll);
                         }
-                        if ui.button("Stage all").on_hover_text(keymap::key_label("⇧A")).clicked() {
+                        if ui.button(mark).on_hover_text(keymap::key_label("⇧A")).clicked() {
                             actions.push(TopBarAction::StageAll);
                         }
                         if let Some(workspace) = self.tabs.get(self.active) {
+                            let noun = if range { "reviewed" } else { "staged" };
                             let summary = format!(
-                                "{} files · {} staged",
+                                "{} files · {} {noun}",
                                 workspace.snapshot.total(),
                                 workspace.snapshot.staged_count()
                             );
@@ -811,7 +861,7 @@ impl DiffViewerApp {
             .tabs
             .iter()
             .map(|workspace| TabInfo {
-                name: workspace.service.repo_name(),
+                name: Self::tab_label(workspace),
                 root: workspace.service.root().to_path_buf(),
                 changes: workspace.snapshot.total(),
             })
@@ -846,7 +896,7 @@ impl DiffViewerApp {
                             ui.label(RichText::new(&status.text).color(color).small());
                         }
                         None => {
-                            ui.label(RichText::new(keymap::hints()).color(self.theme.text_faint).small());
+                            ui.label(RichText::new(keymap::hints(self.is_range())).color(self.theme.text_faint).small());
                         }
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -892,19 +942,26 @@ impl DiffViewerApp {
                     return;
                 };
                 let staged_count = workspace.snapshot.staged_count();
-                Panel::bottom(Id::new("commit_panel"))
-                    .resizable(false)
-                    .show_separator_line(true)
-                    .show(ui, |ui| {
-                        commit_action = commit_box::show(ui, &mut workspace.commit_message, staged_count, focus_commit, &self.theme);
-                    });
+                if !workspace.service.is_range() {
+                    Panel::bottom(Id::new("commit_panel"))
+                        .resizable(false)
+                        .show_separator_line(true)
+                        .show(ui, |ui| {
+                            commit_action = commit_box::show(ui, &mut workspace.commit_message, staged_count, focus_commit, &self.theme);
+                        });
+                }
                 CentralPanel::default()
                     .frame(Frame::NONE)
                     .show(ui, |ui| {
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             ui.add_space(6.0);
-                            ui.label(RichText::new(format!("Changes ({})", workspace.snapshot.total())).strong());
+                            let heading = if workspace.service.is_range() {
+                                format!("Changes ({}/{} read)", staged_count, workspace.snapshot.total())
+                            } else {
+                                format!("Changes ({})", workspace.snapshot.total())
+                            };
+                            ui.label(RichText::new(heading).strong());
                         });
                         ui.add_space(4.0);
                         let groups: Vec<&FileGroup> = visible_groups(&workspace.snapshot, hide_tests).collect();
@@ -949,10 +1006,11 @@ impl DiffViewerApp {
                 };
                 let hunk_count = workspace.diffs.get(&path).and_then(RenderedDiff::diff).map(|diff| diff.hunks.len());
                 let current_hunk = workspace.view.current_hunk;
+                let range = workspace.service.is_range();
                 Panel::top(Id::new("diff_header"))
                     .exact_size(DIFF_HEADER_HEIGHT)
                     .show(ui, |ui| {
-                        header_action = show_diff_header(ui, &file, hunk_count, current_hunk, &self.theme);
+                        header_action = show_diff_header(ui, &file, hunk_count, current_hunk, range, &self.theme);
                     });
                 if workspace.peek.is_some() {
                     Panel::bottom(Id::new("peek_panel"))
@@ -1141,7 +1199,7 @@ fn show_update_notice(ui: &mut Ui, update: &UpdateState, theme: &Theme) -> bool 
     start
 }
 
-fn show_diff_header(ui: &mut egui::Ui, file: &ChangedFile, hunk_count: Option<usize>, current_hunk: Option<usize>, theme: &Theme) -> Option<HeaderAction> {
+fn show_diff_header(ui: &mut egui::Ui, file: &ChangedFile, hunk_count: Option<usize>, current_hunk: Option<usize>, range: bool, theme: &Theme) -> Option<HeaderAction> {
     let mut action = None;
     ui.horizontal_centered(|ui| {
         ui.add_space(8.0);
@@ -1160,15 +1218,16 @@ fn show_diff_header(ui: &mut egui::Ui, file: &ChangedFile, hunk_count: Option<us
         ui.label(RichText::new(format!("−{}", file.stats.removed)).small().color(theme.removed_fg));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.add_space(8.0);
-            let (label, fill, text_color) = if file.is_fully_staged() {
-                ("Unstage  s", theme.surface, theme.text)
-            } else {
-                ("Stage  s", theme.accent, theme.bg)
+            let (label, fill, text_color) = match (range, file.is_fully_staged()) {
+                (true, true) => ("Mark unread  s", theme.surface, theme.text),
+                (true, false) => ("Mark read  s", theme.accent, theme.bg),
+                (false, true) => ("Unstage  s", theme.surface, theme.text),
+                (false, false) => ("Stage  s", theme.accent, theme.bg),
             };
             if ui.add(Button::new(RichText::new(label).color(text_color)).fill(fill)).clicked() {
                 action = Some(HeaderAction::ToggleStage);
             }
-            if ui.add(Button::new(RichText::new("Discard").color(theme.removed_fg))).on_hover_text("d").clicked() {
+            if !range && ui.add(Button::new(RichText::new("Discard").color(theme.removed_fg))).on_hover_text("d").clicked() {
                 action = Some(HeaderAction::Discard);
             }
             ui.separator();

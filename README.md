@@ -62,12 +62,37 @@ dw update       # update to the latest release
 `dw` returns immediately; the app runs detached. If diffviewer is already
 open, the directory is added as a tab in the existing window.
 
+### Reviewing committed work
+
+Pass a range to review commits instead of the working tree — for reading back a
+bigger piece of work you have already committed:
+
+```sh
+dw main..              # your branch since it forked from main
+dw main..feature       # feature since it forked from main
+dw ~/code/app main..   # another repo's branch
+```
+
+`base..head` and `base...head` both mean the same thing: the diff from the
+**merge base**, so commits that landed on `base` after you branched stay out of
+the review. `head` defaults to `HEAD`.
+
+A range review is read-only — no staging, no discarding, no committing. The
+checkbox becomes a *read* marker instead, and `s` marks the file read and jumps
+to the next unread one. Marks are keyed to the file's blob, so when you fix
+something and commit, only the files that actually changed come back unread.
+They live in memory for the session and are not written to disk.
+
+The symbol index follows the branch too: `⌘click` resolves against the commits
+you are reading, not your checkout. **Open in editor** still points at the file
+on disk, which is what you want when you spot something to fix.
+
 ### Keys
 
 | Key | Action |
 | --- | --- |
 | `j` / `k` | next / previous file |
-| `s` or `space` | stage / unstage the file, then advance to the next unstaged file |
+| `s` or `space` | stage the file (mark it read in a range review), then advance to the next one |
 | `n` / `p` | next / previous hunk |
 | `e` | collapse / expand unchanged lines |
 | `t` | hide / show tests |
@@ -77,7 +102,7 @@ open, the directory is added as a tab in the existing window.
 | `⌘click` | peek at a definition · `⌘[` back · `esc` close |
 | `⌘T` | open a folder in a new tab |
 | `⌘1`–`⌘9`, `⌃Tab` | switch tabs · `⌘W` closes the tab |
-| `⌘⇧A` | stage everything |
+| `⌘⇧A` | stage everything (mark all read in a range review) |
 
 On Linux, `Ctrl` replaces `⌘`.
 

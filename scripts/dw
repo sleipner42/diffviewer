@@ -18,10 +18,49 @@ if [ -z "$binary" ]; then
   exit 1
 fi
 
-target="${1:-.}"
-if [ ! -d "$target" ]; then
-  echo "dw: $target is not a directory" >&2
-  exit 1
+# Sort the arguments into a directory and an optional base..head range.
+target=""
+range=""
+for arg in "$@"; do
+  if [ -d "$arg" ]; then
+    [ -z "$target" ] && target="$arg" && continue
+    echo "dw: more than one directory given" >&2
+    exit 1
+  fi
+  case "$arg" in
+    ./*|../*|/*|~*)
+      # Written as a path, so report it as a missing directory even though a
+      # leading "../" would otherwise parse as a range with an empty base.
+      echo "dw: $arg is not a directory" >&2
+      exit 1
+      ;;
+    *..*)
+      if [ -n "$range" ]; then
+        echo "dw: more than one range given" >&2
+        exit 1
+      fi
+      range="$arg"
+      ;;
+    *)
+      echo "dw: $arg is not a directory" >&2
+      exit 1
+      ;;
+  esac
+done
+[ -z "$target" ] && target="."
+
+# The app is launched detached, so its stderr is gone. Check the range here to
+# keep a typo an immediate terminal error rather than a window that never opens.
+if [ -n "$range" ]; then
+  base="${range%%..*}"
+  head="${range##*..}"
+  [ -z "$head" ] && head="HEAD"
+  for rev in "$base" "$head"; do
+    if ! git -C "$target" rev-parse --verify -q "$rev^{commit}" >/dev/null 2>&1; then
+      echo "dw: $rev is not a valid revision" >&2
+      exit 1
+    fi
+  done
 fi
 
-nohup "$binary" "$target" >/dev/null 2>&1 &
+nohup "$binary" "$target" ${range:+"$range"} >/dev/null 2>&1 &

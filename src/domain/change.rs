@@ -40,6 +40,11 @@ pub struct ChangedFile {
     pub kind: ChangeKind,
     pub stage: StageState,
     pub stats: LineStats,
+    /// Identity of *both* sides of this file's diff in range mode (`src:dst`
+    /// blobs); `None` in worktree mode. Review marks are keyed by it, so a mark
+    /// drops when either side really changes — including when the merge base
+    /// moves under a file whose head blob is untouched.
+    pub content_id: Option<String>,
 }
 
 impl ChangedFile {
@@ -84,6 +89,6 @@ impl ChangedFile {
     }
 
     pub fn same_content_identity(&self, other: &ChangedFile) -> bool {
-        self.path == other.path && self.kind == other.kind && self.stats == other.stats
+        self.path == other.path && self.kind == other.kind && self.stats == other.stats && self.content_id == other.content_id
     }
 }

@@ -49,8 +49,13 @@ pub fn poll(ctx: &Context) -> Vec<Command> {
     commands
 }
 
-pub fn hints() -> String {
+pub fn hints(range: bool) -> String {
     let modifier = modifier_symbol();
+    if range {
+        return format!(
+            "j/k files · s mark read · n/p hunks · e collapse · t tests · {modifier}T open · {modifier}1-9 tabs · {modifier}W close tab · {modifier}click definition"
+        );
+    }
     format!(
         "j/k files · s stage · n/p hunks · e collapse · t tests · d discard · c commit message · {modifier}↩ commit · {modifier}T open · {modifier}1-9 tabs · {modifier}W close tab · {modifier}click definition"
     )

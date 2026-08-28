@@ -1,20 +1,29 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, channel};
 use std::thread;
 
 use anyhow::{Context, Result};
+
+use crate::application::repository::RangeSpec;
 
 pub enum Launch {
     Primary(UnixListener),
     Forwarded,
 }
 
-pub fn claim_or_forward(path: &Path) -> Result<Launch> {
+/// What a `dw` invocation asks the window to open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenRequest {
+    pub dir: PathBuf,
+    pub range: Option<RangeSpec>,
+}
+
+pub fn claim_or_forward(request: &OpenRequest) -> Result<Launch> {
     let socket = socket_path();
     if let Ok(mut stream) = UnixStream::connect(&socket) {
-        let message = format!("{OPEN_COMMAND}\t{}\n", path.display());
+        let message = encode(request);
         stream
             .write_all(message.as_bytes())
             .context("sending path to the running diffviewer")?;
@@ -29,7 +38,7 @@ pub fn claim_or_forward(path: &Path) -> Result<Launch> {
     Ok(Launch::Primary(listener))
 }
 
-pub fn spawn_listener(listener: UnixListener, wake: Box<dyn Fn() + Send>) -> Receiver<PathBuf> {
+pub fn spawn_listener(listener: UnixListener, wake: Box<dyn Fn() + Send>) -> Receiver<OpenRequest> {
     let (tx, rx) = channel();
     thread::spawn(move || {
         for connection in listener.incoming() {
@@ -40,13 +49,8 @@ pub fn spawn_listener(listener: UnixListener, wake: Box<dyn Fn() + Send>) -> Rec
             if BufReader::new(&stream).read_line(&mut line).is_err() {
                 continue;
             }
-            let requested = line
-                .trim_end()
-                .strip_prefix(OPEN_COMMAND)
-                .and_then(|rest| rest.strip_prefix('\t'))
-                .map(PathBuf::from);
-            if let Some(path) = requested {
-                if tx.send(path).is_err() {
+            if let Some(request) = decode(line.trim_end()) {
+                if tx.send(request).is_err() {
                     return;
                 }
                 wake();
@@ -57,6 +61,29 @@ pub fn spawn_listener(listener: UnixListener, wake: Box<dyn Fn() + Send>) -> Rec
     rx
 }
 
+fn encode(request: &OpenRequest) -> String {
+    let mut message = format!("{OPEN_COMMAND}\t{}", request.dir.display());
+    if let Some(range) = &request.range {
+        message.push_str(&format!("\t{}\t{}", range.base, range.head));
+    }
+    message.push('\n');
+    message
+}
+
+fn decode(line: &str) -> Option<OpenRequest> {
+    let rest = line.strip_prefix(OPEN_COMMAND)?.strip_prefix('\t')?;
+    let mut fields = rest.split('\t');
+    let dir = PathBuf::from(fields.next()?);
+    let range = match (fields.next(), fields.next()) {
+        (Some(base), Some(head)) if !base.is_empty() && !head.is_empty() => Some(RangeSpec {
+            base: base.to_string(),
+            head: head.to_string(),
+        }),
+        _ => None,
+    };
+    Some(OpenRequest { dir, range })
+}
+
 fn socket_path() -> PathBuf {
     let user = std::env::var("USER").unwrap_or_else(|_| "default".to_string());
     std::env::temp_dir().join(format!("{SOCKET_PREFIX}-{user}.sock"))
@@ -65,3 +92,26 @@ fn socket_path() -> PathBuf {
 const SOCKET_PREFIX: &str = "diffviewer";
 const OPEN_COMMAND: &str = "open";
 const REPLY: &[u8] = b"ok\n";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn round_trip(request: OpenRequest) {
+        let encoded = encode(&request);
+        assert_eq!(decode(encoded.trim_end()), Some(request));
+    }
+
+    #[test]
+    fn round_trips_a_plain_directory() {
+        round_trip(OpenRequest { dir: PathBuf::from("/home/x/repo"), range: None });
+    }
+
+    #[test]
+    fn round_trips_a_range() {
+        round_trip(OpenRequest {
+            dir: PathBuf::from("/home/x/repo"),
+            range: Some(RangeSpec { base: "main".into(), head: "HEAD".into() }),
+        });
+    }
+}
