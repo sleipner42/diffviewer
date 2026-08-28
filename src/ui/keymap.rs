@@ -12,6 +12,7 @@ pub enum Command {
     Refresh,
     StageAll,
     OpenRepo,
+    OpenRange,
     Commit,
     FocusCommit,
     Discard,
@@ -53,11 +54,11 @@ pub fn hints(range: bool) -> String {
     let modifier = modifier_symbol();
     if range {
         return format!(
-            "j/k files · s mark read · n/p hunks · e collapse · t tests · {modifier}T open · {modifier}1-9 tabs · {modifier}W close tab · {modifier}click definition"
+            "j/k files · s mark read · n/p hunks · e collapse · t tests · {modifier}⇧T range · {modifier}T open · {modifier}1-9 tabs · {modifier}W close tab · {modifier}click definition"
         );
     }
     format!(
-        "j/k files · s stage · n/p hunks · e collapse · t tests · d discard · c commit message · {modifier}↩ commit · {modifier}T open · {modifier}1-9 tabs · {modifier}W close tab · {modifier}click definition"
+        "j/k files · s stage · n/p hunks · e collapse · t tests · d discard · c commit message · {modifier}↩ commit · {modifier}⇧T range · {modifier}T open · {modifier}1-9 tabs · {modifier}W close tab · {modifier}click definition"
     )
 }
 
@@ -69,16 +70,20 @@ fn modifier_symbol() -> &'static str {
     if cfg!(target_os = "macos") { "⌘" } else { "Ctrl+" }
 }
 
+// Order matters: `consume_key` matches modifiers *logically*, ignoring extra
+// Shift and Alt, so a shifted binding must be listed before its unshifted
+// sibling or the plain one swallows it first and the shifted one never fires.
 const GLOBAL_BINDINGS: &[(Modifiers, Key, Command)] = &[
+    (Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::T, Command::OpenRange),
+    (Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::A, Command::StageAll),
+    (Modifiers::CTRL.plus(Modifiers::SHIFT), Key::Tab, Command::PrevTab),
+    (Modifiers::CTRL, Key::Tab, Command::NextTab),
     (Modifiers::COMMAND, Key::Enter, Command::Commit),
     (Modifiers::COMMAND, Key::O, Command::OpenRepo),
     (Modifiers::COMMAND, Key::T, Command::OpenRepo),
     (Modifiers::COMMAND, Key::W, Command::CloseTab),
     (Modifiers::COMMAND, Key::R, Command::Refresh),
     (Modifiers::COMMAND, Key::OpenBracket, Command::PeekBack),
-    (Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::A, Command::StageAll),
-    (Modifiers::CTRL, Key::Tab, Command::NextTab),
-    (Modifiers::CTRL.plus(Modifiers::SHIFT), Key::Tab, Command::PrevTab),
     (Modifiers::COMMAND, Key::Num1, Command::SwitchTab(0)),
     (Modifiers::COMMAND, Key::Num2, Command::SwitchTab(1)),
     (Modifiers::COMMAND, Key::Num3, Command::SwitchTab(2)),

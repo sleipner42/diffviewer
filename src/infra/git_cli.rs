@@ -4,7 +4,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use crate::application::repository::{FileStamp, RangeSpec, RepoMode, Repository};
+use crate::application::repository::{FileStamp, GitRef, RangeSpec, RefKind, RepoMode, Repository};
 use crate::domain::change::{ChangeKind, ChangedFile, LineStats, StageState};
 
 pub struct GitCli {
@@ -210,6 +210,20 @@ impl Repository for GitCli {
     fn review_head_id(&self) -> Option<String> {
         let spec = self.mode.range()?;
         self.resolve(&spec.head).ok()
+    }
+
+    fn refs(&self) -> Result<Vec<GitRef>> {
+        let output = self.run_read_only(&[
+            "for-each-ref",
+            // creatordate rather than committerdate: annotated tags have no
+            // committer, so sorting by that drops every tag to the bottom.
+            "--sort=-creatordate",
+            "--format=%(refname)\t%(refname:short)\t%(creatordate:relative)",
+            "refs/heads",
+            "refs/remotes",
+            "refs/tags",
+        ])?;
+        Ok(parse_refs(&String::from_utf8_lossy(&output)))
     }
 
     fn changed_files(&self) -> Result<Vec<ChangedFile>> {
@@ -448,6 +462,36 @@ fn parse_raw(bytes: &[u8]) -> Vec<RawEntry> {
         });
     }
     entries
+}
+
+fn parse_refs(text: &str) -> Vec<GitRef> {
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let full = fields.next()?;
+            let name = fields.next()?;
+            let age = fields.next().unwrap_or_default();
+            // `refs/remotes/<remote>/HEAD` is a symbolic alias, not somewhere to
+            // diff from; it would show up as a bare remote name and confuse.
+            if full.ends_with("/HEAD") {
+                return None;
+            }
+            let kind = if full.starts_with("refs/heads/") {
+                RefKind::Branch
+            } else if full.starts_with("refs/remotes/") {
+                RefKind::Remote
+            } else if full.starts_with("refs/tags/") {
+                RefKind::Tag
+            } else {
+                return None;
+            };
+            Some(GitRef {
+                name: name.to_string(),
+                kind,
+                age: age.to_string(),
+            })
+        })
+        .collect()
 }
 
 fn toplevel(start: &Path) -> Result<PathBuf> {

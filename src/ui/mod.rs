@@ -5,6 +5,7 @@ mod diff_view;
 mod file_list;
 mod keymap;
 mod peek_view;
+mod ref_picker;
 mod rendered;
 mod tab_bar;
 mod theme;

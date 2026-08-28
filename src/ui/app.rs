@@ -13,6 +13,7 @@ use super::diff_view::{self, DiffViewState};
 use super::file_list::{self, FileListAction};
 use super::keymap::{self, Command};
 use super::peek_view::{self, LoadedSource, PeekAction, PeekState};
+use super::ref_picker::{self, PickerAction, RefPicker};
 use super::rendered::{RenderedDiff, ViewRow, view_rows};
 use super::tab_bar::{self, TabAction, TabInfo};
 use super::theme::Theme;
@@ -42,6 +43,7 @@ pub struct DiffViewerApp {
     focus_commit: bool,
     status: Option<StatusLine>,
     pending_discard: Option<ChangedFile>,
+    pending_range: Option<RefPicker>,
 }
 
 struct Workspace {
@@ -91,6 +93,7 @@ enum HeaderAction {
 
 enum TopBarAction {
     OpenRepo,
+    OpenRange,
     Refresh,
     StageAll,
     UnstageAll,
@@ -142,6 +145,7 @@ impl DiffViewerApp {
             focus_commit: false,
             status: None,
             pending_discard: None,
+            pending_range: None,
         };
         if let Some(error) = app.config.load_error.clone() {
             app.report_error(error);
@@ -214,6 +218,7 @@ impl DiffViewerApp {
             self.active = index;
         }
         self.pending_discard = None;
+        self.pending_range = None;
         self.sync_title(ctx);
     }
 
@@ -222,6 +227,7 @@ impl DiffViewerApp {
             return;
         }
         self.tabs.remove(index);
+        self.pending_range = None;
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len().saturating_sub(1);
         } else if index < self.active {
@@ -373,6 +379,7 @@ impl DiffViewerApp {
             Command::Refresh => self.request_refresh(),
             Command::StageAll => self.stage_all(),
             Command::OpenRepo => self.pick_repo(ctx),
+            Command::OpenRange => self.open_range_picker(),
             Command::Commit if self.is_range() => {}
             Command::Commit => self.commit(),
             Command::FocusCommit if self.is_range() => {}
@@ -571,6 +578,47 @@ impl DiffViewerApp {
             workspace.diffs.clear();
             workspace.rows_key = None;
             workspace.worker.request_refresh();
+        }
+    }
+
+    /// Opens the range picker for the active tab, seeded with its current
+    /// endpoints so re-opening an existing range review is a small edit.
+    fn open_range_picker(&mut self) {
+        let Some(workspace) = self.tab() else {
+            self.report_error("Open a repository first".to_string());
+            return;
+        };
+        let refs = match workspace.service.refs() {
+            Ok(refs) => refs,
+            Err(error) => {
+                self.report_error(format!("{error:#}"));
+                return;
+            }
+        };
+        let (base, head) = match workspace.service.mode().range() {
+            Some(spec) => (spec.base.clone(), spec.head.clone()),
+            None => (String::new(), String::new()),
+        };
+        self.pending_range = Some(RefPicker::new(refs, base, head));
+    }
+
+    fn show_range_picker(&mut self, ctx: &Context) {
+        let Some(picker) = self.pending_range.as_mut() else {
+            return;
+        };
+        let theme = self.theme.clone();
+        let action = ref_picker::show(ctx, picker, &theme);
+        match action {
+            Some(PickerAction::Cancel) => self.pending_range = None,
+            Some(PickerAction::Review(spec)) => {
+                self.pending_range = None;
+                let dir = match self.tab() {
+                    Some(workspace) => workspace.service.root().to_path_buf(),
+                    None => return,
+                };
+                self.open_repo(ctx, &OpenRequest { dir, range: Some(spec) });
+            }
+            None => {}
         }
     }
 
@@ -793,8 +841,16 @@ impl DiffViewerApp {
                     match self.tabs.get(self.active) {
                         Some(workspace) => {
                             ui.label(RichText::new(workspace.service.repo_name()).strong());
-                            let prefix = if workspace.service.is_range() { "reviewing" } else { "on" };
-                            ui.label(RichText::new(format!("{prefix} {}", workspace.snapshot.branch)).color(self.theme.text_dim));
+                            let range = workspace.service.is_range();
+                            let prefix = if range { "reviewing" } else { "on" };
+                            let label = RichText::new(format!("{prefix} {}", workspace.snapshot.branch)).color(self.theme.text_dim);
+                            if range {
+                                if ui.link(label).on_hover_text("Change the range").clicked() {
+                                    actions.push(TopBarAction::OpenRange);
+                                }
+                            } else {
+                                ui.label(label);
+                            }
                         }
                         None => {
                             ui.label(RichText::new("No repository").color(self.theme.text_dim));
@@ -803,6 +859,9 @@ impl DiffViewerApp {
                     ui.separator();
                     if ui.button("Open…").on_hover_text(keymap::key_label("T")).clicked() {
                         actions.push(TopBarAction::OpenRepo);
+                    }
+                    if ui.button("Range…").on_hover_text(keymap::key_label("⇧T")).clicked() {
+                        actions.push(TopBarAction::OpenRange);
                     }
                     if ui.button("Refresh").on_hover_text("r").clicked() {
                         actions.push(TopBarAction::Refresh);
@@ -843,6 +902,7 @@ impl DiffViewerApp {
         for action in actions {
             match action {
                 TopBarAction::OpenRepo => self.pick_repo(&ctx),
+                TopBarAction::OpenRange => self.open_range_picker(),
                 TopBarAction::Refresh => self.request_refresh(),
                 TopBarAction::StageAll => self.stage_all(),
                 TopBarAction::UnstageAll => self.unstage_all(),
@@ -1116,7 +1176,7 @@ impl eframe::App for DiffViewerApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.drain_background_events(&ctx);
-        if self.pending_discard.is_none() {
+        if self.pending_discard.is_none() && self.pending_range.is_none() {
             for command in keymap::poll(&ctx) {
                 self.dispatch(&ctx, command);
             }
@@ -1131,6 +1191,7 @@ impl eframe::App for DiffViewerApp {
         self.ensure_peek_loaded();
         self.show_center(ui);
         self.show_discard_modal(&ctx);
+        self.show_range_picker(&ctx);
     }
 }
 

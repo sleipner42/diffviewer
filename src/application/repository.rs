@@ -44,6 +44,32 @@ impl RangeSpec {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefKind {
+    Branch,
+    Remote,
+    Tag,
+}
+
+impl RefKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            RefKind::Branch => "branch",
+            RefKind::Remote => "remote",
+            RefKind::Tag => "tag",
+        }
+    }
+}
+
+/// A ref offered in the range picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitRef {
+    pub name: String,
+    pub kind: RefKind,
+    /// Relative age, for orienting in a long list ("2 hours ago").
+    pub age: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepoMode {
     /// HEAD against the working tree, with staging and committing.
@@ -72,6 +98,8 @@ pub trait Repository: Send + Sync {
     /// Resolved commit of the reviewed head; `None` in worktree mode. The app
     /// watches this to know when a range's content has actually moved.
     fn review_head_id(&self) -> Option<String>;
+    /// Branches, remotes and tags, most recent first, for the range picker.
+    fn refs(&self) -> Result<Vec<GitRef>>;
     fn changed_files(&self) -> Result<Vec<ChangedFile>>;
     fn source_files(&self, extension: &str) -> Result<Vec<PathBuf>>;
     /// Content of the left-hand side: HEAD, or the merge-base in range mode.

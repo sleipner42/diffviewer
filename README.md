@@ -73,15 +73,23 @@ dw main..feature       # feature since it forked from main
 dw ~/code/app main..   # another repo's branch
 ```
 
+Or pick one in the app with `⌘⇧T` (the **Range…** button, or click the range in
+the title bar to change it). Type to filter branches, remotes and tags — newest
+first, matched by prefix, substring or subsequence, so `frr` finds
+`feat/range-review`. `↑↓` selects, `⇥` switches between base and head, `↩`
+confirms. Anything git understands works even though it is not in the list:
+`HEAD~3`, a raw sha, `main@{yesterday}`.
+
 `base..head` and `base...head` both mean the same thing: the diff from the
 **merge base**, so commits that landed on `base` after you branched stay out of
 the review. `head` defaults to `HEAD`.
 
 A range review is read-only — no staging, no discarding, no committing. The
 checkbox becomes a *read* marker instead, and `s` marks the file read and jumps
-to the next unread one. Marks are keyed to the file's blob, so when you fix
-something and commit, only the files that actually changed come back unread.
-They live in memory for the session and are not written to disk.
+to the next unread one. Marks are keyed to both sides of the file's diff, so
+when you fix something and commit — or the base moves under you — only the
+files whose diff actually changed come back unread. They live in memory for the
+session and are not written to disk.
 
 The symbol index follows the branch too: `⌘click` resolves against the commits
 you are reading, not your checkout. **Open in editor** still points at the file
@@ -101,6 +109,7 @@ on disk, which is what you want when you spot something to fix.
 | `⌘↩` | commit staged files |
 | `⌘click` | peek at a definition · `⌘[` back · `esc` close |
 | `⌘T` | open a folder in a new tab |
+| `⌘⇧T` | pick a `base..head` range to review |
 | `⌘1`–`⌘9`, `⌃Tab` | switch tabs · `⌘W` closes the tab |
 | `⌘⇧A` | stage everything (mark all read in a range review) |
 

@@ -4,7 +4,7 @@ use std::sync::RwLock;
 
 use anyhow::{Result, bail};
 
-use super::repository::{FileStamp, RepoMode, Repository};
+use super::repository::{FileStamp, GitRef, RepoMode, Repository};
 use crate::domain::change::{ChangedFile, StageState};
 use crate::domain::diff::{SideBySideDiff, side_by_side};
 use crate::domain::importance::{FileGroup, ImportancePolicy};
@@ -88,6 +88,10 @@ impl ReviewService {
 
     pub fn mode(&self) -> &RepoMode {
         self.repo.mode()
+    }
+
+    pub fn refs(&self) -> Result<Vec<GitRef>> {
+        self.repo.refs()
     }
 
     pub fn is_range(&self) -> bool {
@@ -351,6 +355,9 @@ mod tests {
         }
         fn review_head_id(&self) -> Option<String> {
             Some("fake-head".to_string())
+        }
+        fn refs(&self) -> Result<Vec<GitRef>> {
+            Ok(Vec::new())
         }
         fn changed_files(&self) -> Result<Vec<ChangedFile>> {
             Ok(self.files.lock().unwrap().clone())
