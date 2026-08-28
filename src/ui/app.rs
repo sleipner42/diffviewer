@@ -52,6 +52,10 @@ struct Workspace {
     snapshot: RepoSnapshot,
     selected: Option<PathBuf>,
     diffs: HashMap<PathBuf, RenderedDiff>,
+    /// Files whose diff could not be loaded, with the reason. Kept so the view
+    /// reports the failure instead of sitting on "Loading…" and retrying every
+    /// frame; dropped as soon as the file itself changes.
+    failed: HashMap<PathBuf, (ChangedFile, String)>,
     view: DiffViewState,
     rows: Vec<ViewRow>,
     rows_key: Option<RowsKey>,
@@ -198,6 +202,7 @@ impl DiffViewerApp {
             snapshot: RepoSnapshot::default(),
             selected: None,
             diffs: HashMap::new(),
+            failed: HashMap::new(),
             view: DiffViewState::new(self.collapse_unchanged),
             rows: Vec::new(),
             rows_key: None,
@@ -292,6 +297,9 @@ impl DiffViewerApp {
             snapshot
                 .find(path)
                 .is_some_and(|file| file.same_content_identity(&rendered.file))
+        });
+        workspace.failed.retain(|path, (failed, _)| {
+            snapshot.find(path).is_some_and(|file| file.same_content_identity(failed))
         });
         let touched: Vec<PathBuf> = workspace
             .snapshot
@@ -576,6 +584,7 @@ impl DiffViewerApp {
     fn request_refresh(&mut self) {
         if let Some(workspace) = self.tab_mut() {
             workspace.diffs.clear();
+            workspace.failed.clear();
             workspace.rows_key = None;
             workspace.worker.request_refresh();
         }
@@ -687,7 +696,7 @@ impl DiffViewerApp {
             workspace.diffs.remove(&path);
             workspace.rows_key = None;
         }
-        if workspace.diffs.contains_key(&path) {
+        if workspace.diffs.contains_key(&path) || workspace.failed.contains_key(&path) {
             return;
         }
         match workspace.service.load_diff(&file) {
@@ -696,7 +705,11 @@ impl DiffViewerApp {
                 workspace.diffs.insert(path, rendered);
                 workspace.rows_key = None;
             }
-            Err(error) => self.report_error(error.to_string()),
+            Err(error) => {
+                let message = format!("{error:#}");
+                workspace.failed.insert(path, (file, message.clone()));
+                self.report_error(message);
+            }
         }
     }
 
@@ -1091,7 +1104,10 @@ impl DiffViewerApp {
                                 definition_request = Some((rendered.file.path.clone(), hit));
                             }
                         }
-                        None => diff_view::centered_message(ui, "Loading…", &self.theme),
+                        None => match workspace.failed.get(&path) {
+                            Some((_, reason)) => diff_view::centered_message(ui, reason, &self.theme),
+                            None => diff_view::centered_message(ui, "Loading…", &self.theme),
+                        },
                     });
             });
         if let Some((path, hit)) = definition_request {

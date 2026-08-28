@@ -270,7 +270,15 @@ impl Repository for GitCli {
 
     fn new_content(&self, path: &Path) -> Result<Option<Vec<u8>>> {
         let Some(head) = self.diff_head() else {
-            return match std::fs::read(self.root.join(path)) {
+            let absolute = self.root.join(path);
+            // Not every entry git reports is a readable file: an untracked
+            // nested repository arrives as `dir/`, and a symlink can point at a
+            // directory. There is nothing to diff, and returning an error here
+            // strands the view on "Loading…" and retries once a second forever.
+            if std::fs::metadata(&absolute).is_ok_and(|meta| !meta.is_file()) {
+                return Ok(None);
+            }
+            return match std::fs::read(&absolute) {
                 Ok(content) => Ok(Some(content)),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
@@ -553,6 +561,59 @@ const UNMERGED_FIELDS: usize = 10;
 const BINARY_PROBE_BYTES: usize = 8000;
 
 #[cfg(test)]
+mod worktree_tests {
+    use super::*;
+
+    /// A repo containing an untracked nested repository, which `git status`
+    /// reports as a single directory entry rather than a file.
+    fn fixture(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("diffviewer-wt-{name}"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        let run = |dir: &Path, args: &[&str]| {
+            let out = Command::new(GIT).arg("-C").arg(dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&root, &["init", "-q", "-b", "main"]);
+        run(&root, &["config", "user.email", "test@example.com"]);
+        run(&root, &["config", "user.name", "Test"]);
+        run(&root, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(root.join("a.txt"), "hi\n").unwrap();
+        run(&root, &["add", "-A"]);
+        run(&root, &["commit", "-qm", "base"]);
+        run(&root.join("nested"), &["init", "-q"]);
+        std::fs::write(root.join("nested/f.txt"), "x\n").unwrap();
+        root
+    }
+
+    #[test]
+    fn a_directory_entry_has_no_content_rather_than_erroring() {
+        // Erroring here stranded the diff view on "Loading…" forever, retrying
+        // once a second, because the failure was reported but never recorded.
+        let root = fixture("nested-repo");
+        let repo = GitCli::discover(&root).unwrap();
+        let files = repo.changed_files().unwrap();
+        let entry = files
+            .iter()
+            .find(|file| file.path.to_string_lossy().starts_with("nested"))
+            .expect("git reports the nested repo as an entry");
+        assert!(repo.new_content(&entry.path).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ordinary_files_still_read_normally() {
+        let root = fixture("plain-file");
+        let repo = GitCli::discover(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "changed\n").unwrap();
+        let content = repo.new_content(Path::new("a.txt")).unwrap().unwrap();
+        assert_eq!(String::from_utf8_lossy(&content), "changed\n");
+        assert!(repo.new_content(Path::new("missing.txt")).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
 mod range_tests {
     use super::*;
     use crate::application::repository::RangeSpec;
@@ -724,3 +785,5 @@ mod tests {
         assert!(stats.contains_key(&PathBuf::from("new.py")));
     }
 }
+
+
