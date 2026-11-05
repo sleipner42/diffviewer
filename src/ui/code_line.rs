@@ -27,15 +27,20 @@ pub struct WordHit {
     pub attribute_access: bool,
 }
 
-#[allow(clippy::too_many_arguments)]
+pub struct CodeLine<'a> {
+    pub number: Option<usize>,
+    pub text: &'a str,
+    pub visible: Range<usize>,
+    pub indent: f32,
+    pub spans: &'a [Span],
+    pub emphasis: &'a [Range<usize>],
+}
+
 pub fn paint_code_line(
     painter: &Painter,
     rect: Rect,
     gutter_width: f32,
-    number: usize,
-    text: &str,
-    spans: &[Span],
-    emphasis: &[Range<usize>],
+    line: &CodeLine,
     style: &LineStyle,
     pointer: Option<PointerState>,
     scroll_x: f32,
@@ -45,23 +50,24 @@ pub fn paint_code_line(
         painter.rect_filled(rect, 0.0, style.background);
     }
     painter.rect_filled(gutter, 0.0, style.gutter_background);
-    painter.text(
-        pos2(gutter.right() - GUTTER_PADDING, rect.center().y),
-        Align2::RIGHT_CENTER,
-        number.to_string(),
-        style.font.clone(),
-        style.line_number_color,
-    );
+    if let Some(number) = line.number {
+        painter.text(
+            pos2(gutter.right() - GUTTER_PADDING, rect.center().y),
+            Align2::RIGHT_CENTER,
+            number.to_string(),
+            style.font.clone(),
+            style.line_number_color,
+        );
+    }
     let text_area = Rect::from_min_max(pos2(gutter.right(), rect.top()), rect.max);
     let text_painter = painter.with_clip_rect(text_area.intersect(painter.clip_rect()));
-    let job = line_job(text, spans, emphasis, style.font, style.text_color, style.emphasis_background);
-    let galley = text_painter.layout_job(job);
-    let text_pos = pos2(gutter.right() + TEXT_PADDING - scroll_x, rect.top() + ROW_PADDING_Y);
+    let galley = text_painter.layout_job(line_job(line, style));
+    let text_pos = pos2(gutter.right() + TEXT_PADDING + line.indent - scroll_x, rect.top() + ROW_PADDING_Y);
     let hit = pointer
         .filter(|pointer| pointer.command && text_area.contains(pointer.pos))
         .and_then(|pointer| {
             let cursor = galley.cursor_from_pos(pointer.pos - text_pos);
-            word_at_char(text, cursor.index.0)
+            word_in_visible_part(line.text, &line.visible, cursor.index.0)
         });
     if let Some((_, char_range)) = &hit {
         let left = galley.pos_from_cursor(CCursor::new(CharIndex(char_range.start))).left();
@@ -80,45 +86,48 @@ pub fn text_width(char_count: usize, char_width: f32) -> f32 {
     char_count as f32 * char_width + TEXT_PADDING * 2.0
 }
 
-pub fn line_job(
-    text: &str,
-    spans: &[Span],
-    emphasis: &[Range<usize>],
-    font: &FontId,
-    default_color: Color32,
-    emphasis_background: Color32,
-) -> LayoutJob {
+fn line_job(line: &CodeLine, style: &LineStyle) -> LayoutJob {
     let mut job = LayoutJob::default();
     job.wrap.max_width = f32::INFINITY;
-    if text.is_empty() {
+    let visible = &line.visible;
+    if visible.is_empty() {
         return job;
     }
-    let mut boundaries: Vec<usize> = vec![0, text.len()];
-    boundaries.extend(spans.iter().flat_map(|span| [span.range.start, span.range.end]));
-    boundaries.extend(emphasis.iter().flat_map(|range| [range.start, range.end]));
-    boundaries.retain(|&offset| offset <= text.len() && text.is_char_boundary(offset));
+    let mut boundaries: Vec<usize> = vec![visible.start, visible.end];
+    boundaries.extend(line.spans.iter().flat_map(|span| [span.range.start, span.range.end]));
+    boundaries.extend(line.emphasis.iter().flat_map(|range| [range.start, range.end]));
+    boundaries.retain(|&offset| visible.start <= offset && offset <= visible.end && line.text.is_char_boundary(offset));
     boundaries.sort_unstable();
     boundaries.dedup();
     for pair in boundaries.windows(2) {
         let (start, end) = (pair[0], pair[1]);
-        let color = spans
+        let color = line
+            .spans
             .iter()
             .find(|span| span.range.start <= start && start < span.range.end)
             .map(|span| Color32::from_rgb(span.color.r, span.color.g, span.color.b))
-            .unwrap_or(default_color);
-        let emphasized = emphasis.iter().any(|range| range.start <= start && start < range.end);
+            .unwrap_or(style.text_color);
+        let emphasized = line.emphasis.iter().any(|range| range.start <= start && start < range.end);
         job.append(
-            &text[start..end],
+            &line.text[start..end],
             0.0,
             TextFormat {
-                font_id: font.clone(),
+                font_id: style.font.clone(),
                 color,
-                background: if emphasized { emphasis_background } else { Color32::TRANSPARENT },
+                background: if emphasized { style.emphasis_background } else { Color32::TRANSPARENT },
                 ..Default::default()
             },
         );
     }
     job
+}
+
+fn word_in_visible_part(text: &str, visible: &Range<usize>, visible_char: usize) -> Option<(WordHit, Range<usize>)> {
+    let visible_chars = text[visible.clone()].chars().count();
+    let last = visible_chars.checked_sub(1)?;
+    let offset = text[..visible.start].chars().count();
+    let (hit, range) = word_at_char(text, offset + visible_char.min(last))?;
+    Some((hit, range.start.saturating_sub(offset)..(range.end - offset).min(visible_chars)))
 }
 
 fn word_at_char(text: &str, char_index: usize) -> Option<(WordHit, Range<usize>)> {
@@ -165,6 +174,43 @@ mod tests {
         let (hit, _) = word_at_char(text, 4).unwrap();
         assert_eq!(hit.word, "traces");
         assert!(!hit.attribute_access);
+    }
+
+    #[test]
+    fn resolves_a_word_from_a_wrapped_part_of_the_line() {
+        let text = "first second_word third";
+        let visible = text.find("second").unwrap()..text.find("third").unwrap();
+        let (hit, range) = word_in_visible_part(text, &visible, 2).unwrap();
+        assert_eq!(hit.word, "second_word");
+        assert_eq!(range, 0.."second_word".len());
+    }
+
+    #[test]
+    fn clamps_the_highlight_when_a_word_spans_two_visual_lines() {
+        let text = "first second_word";
+        let start = text.find("second").unwrap();
+        let visible = start..start + "second".len();
+        let (hit, range) = word_in_visible_part(text, &visible, 1).unwrap();
+        assert_eq!(hit.word, "second_word");
+        assert_eq!(range, 0.."second".len());
+        let continuation = start + "second".len()..text.len();
+        let (hit, range) = word_in_visible_part(text, &continuation, 1).unwrap();
+        assert_eq!(hit.word, "second_word");
+        assert_eq!(range, 0.."_word".len());
+    }
+
+    #[test]
+    fn a_pointer_past_the_visual_line_stays_on_that_line() {
+        let text = "first second";
+        let visible = 0.."first ".len();
+        assert!(word_in_visible_part(text, &visible, 99).is_none());
+        let visible = 0.."first".len();
+        assert_eq!(word_in_visible_part(text, &visible, 99).unwrap().0.word, "first");
+    }
+
+    #[test]
+    fn a_blank_continuation_has_no_word() {
+        assert!(word_in_visible_part("first second", &(0..0), 0).is_none());
     }
 
     #[test]

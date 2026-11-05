@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use egui::{Align, Button, Color32, CursorIcon, Layout, RichText, ScrollArea, Sense, TextStyle, Ui, vec2};
 
-use super::code_line::{GUTTER_PADDING, LineStyle, PointerState, ROW_PADDING_Y, TEXT_PADDING, WordHit, paint_code_line};
+use super::code_line::{CodeLine, GUTTER_PADDING, LineStyle, PointerState, ROW_PADDING_Y, TEXT_PADDING, WordHit, paint_code_line};
 use super::keymap;
 use super::theme::Theme;
 use crate::application::review_service::PeekSource;
@@ -223,8 +223,16 @@ fn body(ui: &mut Ui, source: &LoadedSource, scroll_pending: &mut bool, theme: &T
                 emphasis_background: Color32::TRANSPARENT,
                 link_color: theme.accent,
             };
-            let spans = source.spans.get(index).map(Vec::as_slice).unwrap_or(&[]);
-            let hit = paint_code_line(&painter, rect, gutter_width, index + 1, &source.lines[index], spans, &[], &style, pointer, 0.0);
+            let text = &source.lines[index];
+            let line = CodeLine {
+                number: Some(index + 1),
+                text,
+                visible: 0..text.len(),
+                indent: 0.0,
+                spans: source.spans.get(index).map(Vec::as_slice).unwrap_or(&[]),
+                emphasis: &[],
+            };
+            let hit = paint_code_line(&painter, rect, gutter_width, &line, &style, pointer, 0.0);
             if hit.is_some() {
                 ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
             }

@@ -3,3 +3,4 @@ pub mod diff;
 pub mod importance;
 pub mod python;
 pub mod symbols;
+pub mod wrap;

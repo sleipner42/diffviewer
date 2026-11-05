@@ -39,6 +39,7 @@ pub struct DiffViewerApp {
     update: UpdateState,
     hide_tests: bool,
     collapse_unchanged: bool,
+    wrap_lines: bool,
     focus_commit: bool,
     status: Option<StatusLine>,
     pending_discard: Option<ChangedFile>,
@@ -134,6 +135,7 @@ impl DiffViewerApp {
             highlighter: Highlighter::new(),
             hide_tests: config.hide_tests,
             collapse_unchanged: false,
+            wrap_lines: true,
             config,
             tabs: Vec::new(),
             active: 0,
@@ -333,6 +335,7 @@ impl DiffViewerApp {
                 self.collapse_unchanged = !self.collapse_unchanged;
                 self.sync_collapse();
             }
+            Command::ToggleWrap => self.wrap_lines = !self.wrap_lines,
             Command::Refresh => self.request_refresh(),
             Command::StageAll => self.stage_all(),
             Command::OpenRepo => self.pick_repo(ctx),
@@ -633,6 +636,7 @@ impl DiffViewerApp {
                 .map(|diff| view_rows(diff, workspace.view.collapsed, &workspace.view.expanded_gaps))
                 .unwrap_or_default();
             workspace.rows_key = Some(key);
+            workspace.view.invalidate_visual_rows();
         }
         if workspace.scroll_to_first_hunk {
             workspace.scroll_to_first_hunk = false;
@@ -771,6 +775,7 @@ impl DiffViewerApp {
                     if ui.toggle_value(&mut self.collapse_unchanged, "Collapse unchanged").on_hover_text("e").changed() {
                         actions.push(TopBarAction::CollapseToggled);
                     }
+                    ui.toggle_value(&mut self.wrap_lines, "Wrap lines").on_hover_text("w");
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.add_space(6.0);
                         if ui.button("Unstage all").clicked() {
@@ -932,6 +937,7 @@ impl DiffViewerApp {
         let mut definition_request: Option<(PathBuf, WordHit)> = None;
         let editor_name = editor::editor_display_name(&self.config.editor_command);
         let active = self.active;
+        let wrap_lines = self.wrap_lines;
         CentralPanel::default()
             .frame(Frame::NONE.fill(self.theme.bg))
             .show(ui, |ui| {
@@ -969,7 +975,7 @@ impl DiffViewerApp {
                     .frame(Frame::NONE)
                     .show(ui, |ui| match workspace.diffs.get(&path) {
                         Some(rendered) => {
-                            if let Some(hit) = diff_view::show(ui, rendered, &workspace.rows, &mut workspace.view, &self.theme) {
+                            if let Some(hit) = diff_view::show(ui, rendered, &workspace.rows, &mut workspace.view, wrap_lines, &self.theme) {
                                 definition_request = Some((rendered.file.path.clone(), hit));
                             }
                         }

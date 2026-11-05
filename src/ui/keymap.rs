@@ -9,6 +9,7 @@ pub enum Command {
     PrevHunk,
     ToggleTests,
     ToggleCollapse,
+    ToggleWrap,
     Refresh,
     StageAll,
     OpenRepo,
@@ -52,7 +53,7 @@ pub fn poll(ctx: &Context) -> Vec<Command> {
 pub fn hints() -> String {
     let modifier = modifier_symbol();
     format!(
-        "j/k files · s stage · n/p hunks · e collapse · t tests · d discard · c commit message · {modifier}↩ commit · {modifier}T open · {modifier}1-9 tabs · {modifier}W close tab · {modifier}click definition"
+        "j/k files · s stage · n/p hunks · e collapse · w wrap · t tests · d discard · c commit message · {modifier}↩ commit · {modifier}T open · {modifier}1-9 tabs · {modifier}W close tab · {modifier}click definition"
     )
 }
 
@@ -96,6 +97,7 @@ const PLAIN_BINDINGS: &[(Key, Command)] = &[
     (Key::P, Command::PrevHunk),
     (Key::T, Command::ToggleTests),
     (Key::E, Command::ToggleCollapse),
+    (Key::W, Command::ToggleWrap),
     (Key::R, Command::Refresh),
     (Key::C, Command::FocusCommit),
     (Key::D, Command::Discard),

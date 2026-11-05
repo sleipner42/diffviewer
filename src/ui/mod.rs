@@ -8,3 +8,4 @@ mod peek_view;
 mod rendered;
 mod tab_bar;
 mod theme;
+mod visual_rows;
